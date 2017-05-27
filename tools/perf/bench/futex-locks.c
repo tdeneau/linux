@@ -458,33 +458,33 @@ static void gc_mutex_unlock(futex_t *futex __maybe_unused,
 
 /**************************************************************************/
 
+static inline void csdelay(int n)
+{
+	while (n-- > 0) {
+	  volatile int i=2;
+	  while (i-- > 0);
+	}
+}
+
 /*
  * Load function
  */
-static inline void load(int tid)
+static inline void load(int tid  __maybe_unused)
 {
-	int n = loadlat;
-
 	/*
 	 * Optionally does a 1us sleep instead if wratio is defined and
 	 * is within bound.
 	 */
-	if (wratio && (((counter++ + tid) & 0x3ff) < wratio)) {
+#if 0
+  if (wratio && (((counter++ + tid) & 0x3ff) < wratio)) {
 		usleep(1);
 		return;
 	}
-
-	while (n-- > 0)
-		cpu_relax();
+#endif
+  
+	csdelay(loadlat);
 }
 
-static inline void csdelay(void)
-{
-	int n = locklat;
-
-	while (n-- > 0)
-		cpu_relax();
-}
 
 static void toggle_done(int sig __maybe_unused,
 			siginfo_t *info __maybe_unused,
@@ -504,6 +504,7 @@ static void *mutex_workerfn(void *arg)
 	struct worker *w = &worker[tid];
 	lock_fn_t lock_fn = mutex_lock_fn;
 	unlock_fn_t unlock_fn = mutex_unlock_fn;
+	// u32 ops_count = 0;
 
 	thread_id = gettid();
 	counter = 0;
@@ -521,9 +522,9 @@ static void *mutex_workerfn(void *arg)
 		load(tid);
 		unlock_fn(w->futex, tid);
 		w->stats[STAT_OPS]++;	/* One more locking operation */
-		csdelay();
+		csdelay(locklat);
 	}  while (!done);
-
+	
 	if (verbose)
 		printf("[thread %3ld (%d)] exited.\n", tid, thread_id);
 	atomic_inc_return(&threads_stopping);
@@ -542,9 +543,11 @@ static void create_threads(struct worker *w, pthread_attr_t *thread_attr,
 	CPU_SET(tid % ncpus, &cpu);
 	w->futex = pfutex;
 
+#if 0
 	if (pthread_attr_setaffinity_np(thread_attr, sizeof(cpu_set_t), &cpu))
 		err(EXIT_FAILURE, "pthread_attr_setaffinity_np");
-
+#endif
+	
 	if (pthread_create(&w->thread, thread_attr, workerfn, (void *)tid))
 		err(EXIT_FAILURE, "pthread_create");
 }
