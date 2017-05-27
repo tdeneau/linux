@@ -20,6 +20,7 @@
 #include "builtin.h"
 #include "bench/bench.h"
 
+#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +63,7 @@ static struct bench futex_benchmarks[] = {
 	{ "requeue",	"Benchmark for futex requeue calls",            bench_futex_requeue	},
 	/* pi-futexes */
 	{ "lock-pi",	"Benchmark for futex lock_pi calls",            bench_futex_lock_pi	},
+	{ "mutex",	"Benchmark for mutex locks using futexes",	bench_futex_mutex	},
 	{ "all",	"Run all futex benchmarks",			NULL			},
 	{ NULL,		NULL,						NULL			}
 };
@@ -215,12 +217,20 @@ int cmd_bench(int argc, const char **argv, const char *prefix __maybe_unused)
 {
 	struct collection *coll;
 	int ret = 0;
+	char *locale;
 
 	if (argc < 2) {
 		/* No collection specified. */
 		print_usage();
 		goto end;
 	}
+
+	/*
+	 * Enable better number formatting.
+	 */
+	locale = setlocale(LC_NUMERIC, "");
+	if (!strcmp(locale, "C"))
+		setlocale(LC_NUMERIC, "en_US");
 
 	argc = parse_options(argc, argv, bench_options, bench_usage,
 			     PARSE_OPT_STOP_AT_NON_OPTION);

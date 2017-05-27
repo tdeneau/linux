@@ -203,6 +203,8 @@ Suite for evaluating requeue calls.
 *lock-pi*::
 Suite for evaluating futex lock_pi calls.
 
+*mutex*::
+Suite for evaluating futex calls for implementing userspace mutexes.
 
 SEE ALSO
 --------
