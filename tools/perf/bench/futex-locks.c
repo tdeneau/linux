@@ -30,12 +30,14 @@
 #include <sys/time.h>
 
 #define CACHELINE_SIZE		64
+#define WORKERBUFSIZE 128*1024
 #define gettid()		syscall(SYS_gettid)
 #define __cacheline_aligned	__attribute__((__aligned__(CACHELINE_SIZE)))
 
 typedef u32 futex_t;
 typedef void (*lock_fn_t)(futex_t *futex, int tid);
 typedef void (*unlock_fn_t)(futex_t *futex, int tid);
+
 
 /*
  * Statistical count list
@@ -75,6 +77,10 @@ struct worker {
 	 * Lock/unlock times
 	 */
 	u64 times[TIME_NUM];
+  u8 buf[WORKERBUFSIZE];
+  u32 nextindex;
+  u32 dummy;
+  
 } __cacheline_aligned;
 
 /*
@@ -96,6 +102,7 @@ static const char *ftype;
 static int loadlat = 1;
 static int locklat = 1;
 static int wratio;
+static int bufstep = 64;
 struct timeval start, end, runtime;
 struct timespec *ptospec = NULL;
 struct timespec tospec;
@@ -190,6 +197,7 @@ static const struct option mutex_options[] = {
 	OPT_UINTEGER('t', "threads",	&nthreads, "Specify number of threads, default = # of CPUs"),
 	OPT_BOOLEAN ('v', "verbose",	&verbose,  "Verbose mode: display thread-level details"),
 	OPT_INTEGER ('w', "wait-ratio", &wratio,   "Specify <n>/1024 of load is 1us sleep, default = 0"),
+	OPT_INTEGER ('b', "bufstep",    &bufstep,  "Step size in bytes thru buffer during delays, default = 64"),
 	OPT_END()
 };
 
@@ -458,12 +466,27 @@ static void gc_mutex_unlock(futex_t *futex __maybe_unused,
 
 /**************************************************************************/
 
-static inline void csdelay(int n)
+static inline void csdelay(int n, int tid)
 {
-	while (n-- > 0) {
-	  volatile int i=2;
-	  while (i-- > 0);
+  struct worker *w = &worker[tid];
+  u32 sum = 0;
+  while (n-- > 0) {
+	sum += w->buf[w->nextindex];
+	w->nextindex += bufstep;
+	if (w->nextindex > WORKERBUFSIZE) {
+	  w->nextindex = 0;
 	}
+  }
+  w->dummy = sum;
+
+#if 0
+  volatile int i = 0;
+  volatile __maybe_unused int j;
+	while (n > 0) {
+	  i--;
+	  n -= 2;
+	}
+#endif
 }
 
 /*
@@ -482,7 +505,7 @@ static inline void load(int tid  __maybe_unused)
 	}
 #endif
   
-	csdelay(loadlat);
+  csdelay(loadlat, tid);
 }
 
 
@@ -522,7 +545,7 @@ static void *mutex_workerfn(void *arg)
 		load(tid);
 		unlock_fn(w->futex, tid);
 		w->stats[STAT_OPS]++;	/* One more locking operation */
-		csdelay(locklat);
+		csdelay(locklat, tid);
 	}  while (!done);
 	
 	if (verbose)
@@ -542,6 +565,7 @@ static void create_threads(struct worker *w, pthread_attr_t *thread_attr,
 	CPU_ZERO(&cpu);
 	CPU_SET(tid % ncpus, &cpu);
 	w->futex = pfutex;
+	w->nextindex = 0;
 
 #if 0
 	if (pthread_attr_setaffinity_np(thread_attr, sizeof(cpu_set_t), &cpu))
