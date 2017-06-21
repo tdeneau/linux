@@ -450,6 +450,17 @@ static void pi_mutex_unlock(futex_t *futex, int tid)
 }
 
 /*
+ * Null futex lock/unlock functions
+ */
+static void null_mutex_lock(futex_t *futex __maybe_unused, int tid __maybe_unused)
+{
+}
+
+static void null_mutex_unlock(futex_t *futex __maybe_unused, int tid __maybe_unused)
+{
+}
+
+/*
  * Glibc mutex lock and unlock function
  */
 static void gc_mutex_lock(futex_t *futex __maybe_unused,
@@ -609,6 +620,10 @@ static int futex_mutex_type(const char **ptype)
 		}
 		pthread_mutex_init(&mutex, attr);
 		mutex_inited = true;
+	} else if (!strcasecmp(type, "NONE")) {
+		*ptype = "NONE";
+		mutex_lock_fn = null_mutex_lock;
+		mutex_unlock_fn = null_mutex_unlock;
 	} else {
 		return -1;
 	}
