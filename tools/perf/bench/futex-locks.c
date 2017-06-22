@@ -407,6 +407,51 @@ static void ww2_mutex_unlock(futex_t *futex, int tid)
 	}
 }
 
+
+/*
+ * Version of ww_mutex_lock where we read the futex first
+ * and so might avoid the first cmpxchg
+ */
+
+static void ww3_mutex_lock(futex_t *futex, int tid)
+{
+	futex_t val = 0;
+	int ret;
+
+	if (*futex != 0) {
+	  goto slowpath;
+	}
+	if (atomic_cmpxchg_acquire(futex, &val, 1))
+		return;
+
+slowpath:
+	stat_inc(tid, STAT_LOCKS);
+	for (;;) {
+		if (val != 2) {
+			/*
+			 * Force value to 2 to indicate waiter
+			 */
+			val = atomic_xchg_acquire(futex, 2);
+			if (val == 0)
+				return;
+		}
+		FUTEX_CALL(futex_wait, TIME_LOCK, futex, 2, ptospec, flags);
+
+		if (ret < 0) {
+			if (errno == EAGAIN)
+				stat_inc(tid, STAT_EAGAINS);
+			else if (errno == ETIMEDOUT)
+				stat_inc(tid, STAT_TIMEOUTS);
+			else
+				stat_inc(tid, STAT_LOCKERRS);
+		}
+
+		val = *futex;
+	}
+}
+
+
+
 /*
  * PI futex lock/unlock functions
  */
@@ -599,6 +644,10 @@ static int futex_mutex_type(const char **ptype)
 		*ptype = "WW2";
 		mutex_lock_fn = ww2_mutex_lock;
 		mutex_unlock_fn = ww2_mutex_unlock;
+	} else if (!strcasecmp(type, "WW3")) {
+		*ptype = "WW3";
+		mutex_lock_fn = ww3_mutex_lock;
+		mutex_unlock_fn = ww_mutex_unlock;
 	} else if (!strcasecmp(type, "PI")) {
 		*ptype = "PI";
 		mutex_lock_fn = pi_mutex_lock;
