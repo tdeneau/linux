@@ -451,6 +451,48 @@ slowpath:
 }
 
 
+/*
+ * Version of ww_mutex_lock where we just always call the futex
+ * (this is not really a mutex but we wanted to time the futex path)
+ */
+
+static void ww4_mutex_lock(futex_t *futex, int tid)
+{
+	int ret;
+
+	if (tid & 1) return;
+	
+	stat_inc(tid, STAT_LOCKS);
+	*futex = 0;
+	FUTEX_CALL(futex_wait, TIME_LOCK, futex, 0, ptospec, flags);
+	
+	if (ret < 0) {
+	  if (errno == EAGAIN)
+		stat_inc(tid, STAT_EAGAINS);
+	  else if (errno == ETIMEDOUT)
+		stat_inc(tid, STAT_TIMEOUTS);
+	  else
+		stat_inc(tid, STAT_LOCKERRS);
+	}
+}
+
+static void ww4_mutex_unlock(futex_t *futex, int tid)
+{
+	int ret;
+
+	if ((tid & 1) == 0) return;
+	
+	*futex = 0;
+	stat_inc(tid, STAT_UNLOCKS);
+	FUTEX_CALL(futex_wake, TIME_UNLK, futex, 1, flags);
+	
+	if (ret < 0)
+	  stat_inc(tid, STAT_UNLKERRS);
+	else
+	  stat_add(tid, STAT_WAKEUPS, ret);
+}
+
+
 
 /*
  * PI futex lock/unlock functions
@@ -648,6 +690,10 @@ static int futex_mutex_type(const char **ptype)
 		*ptype = "WW3";
 		mutex_lock_fn = ww3_mutex_lock;
 		mutex_unlock_fn = ww_mutex_unlock;
+	} else if (!strcasecmp(type, "WW4")) {
+		*ptype = "WW4";
+		mutex_lock_fn = ww4_mutex_lock;
+		mutex_unlock_fn = ww4_mutex_unlock;
 	} else if (!strcasecmp(type, "PI")) {
 		*ptype = "PI";
 		mutex_lock_fn = pi_mutex_lock;
