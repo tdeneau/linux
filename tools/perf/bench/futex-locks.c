@@ -103,6 +103,7 @@ static int loadlat = 1;
 static int locklat = 1;
 static int wratio;
 static int bufstep = 64;
+static int cmpxchg_limit = 1;
 struct timeval start, end, runtime;
 struct timespec *ptospec = NULL;
 struct timespec tospec;
@@ -198,6 +199,7 @@ static const struct option mutex_options[] = {
 	OPT_BOOLEAN ('v', "verbose",	&verbose,  "Verbose mode: display thread-level details"),
 	OPT_INTEGER ('w', "wait-ratio", &wratio,   "Specify <n>/1024 of load is 1us sleep, default = 0"),
 	OPT_INTEGER ('b', "bufstep",    &bufstep,  "Step size in bytes thru buffer during delays, default = 64"),
+	OPT_INTEGER ('x', "cmpxchg-limit",    &cmpxchg_limit,  "limit to number of cmpxchgs in nokernel_lock"),
 	OPT_END()
 };
 
@@ -456,7 +458,7 @@ slowpath:
  * (this is not really a mutex but we wanted to time the futex path)
  */
 
-static void ww4_mutex_lock(futex_t *futex, int tid)
+static void nousermode_mutex_lock(futex_t *futex, int tid)
 {
 	int ret;
 
@@ -476,7 +478,7 @@ static void ww4_mutex_lock(futex_t *futex, int tid)
 	}
 }
 
-static void ww4_mutex_unlock(futex_t *futex, int tid)
+static void nousermode_mutex_unlock(futex_t *futex, int tid)
 {
 	int ret;
 
@@ -490,6 +492,45 @@ static void ww4_mutex_unlock(futex_t *futex, int tid)
 	  stat_inc(tid, STAT_UNLKERRS);
 	else
 	  stat_add(tid, STAT_WAKEUPS, ret);
+}
+
+
+
+/*
+ * Version of ww_mutex_lock where we just try the cmpxchg in user mode
+ * but never call the futex_wait nor futex_wake.  The number of times we try the
+ * cmpxchg is configurable.  (Note that this is not really a mutex
+ * but we wanted to time the usermode path under contention)
+ */
+static void nokernel_mutex_lock(futex_t *futex, int tid)
+{
+  futex_t val;
+	int tries = 0;
+	
+	while(1) {
+	  val = 0;
+	  if (atomic_cmpxchg_acquire(futex, &val, 1))
+		break;
+	  
+	  tries++;
+	  if (tries >= cmpxchg_limit)
+		break;
+	}
+	
+	if (tries > 0) {
+	  stat_add(tid, STAT_LOCKS, tries);
+	}
+}
+
+static void nokernel_mutex_unlock(futex_t *futex, int tid)
+{
+	futex_t val;
+
+	val = atomic_xchg_release(futex, 0);
+
+	if (val != 0) {
+		stat_inc(tid, STAT_UNLOCKS);
+	}
 }
 
 
@@ -690,10 +731,14 @@ static int futex_mutex_type(const char **ptype)
 		*ptype = "WW3";
 		mutex_lock_fn = ww3_mutex_lock;
 		mutex_unlock_fn = ww_mutex_unlock;
-	} else if (!strcasecmp(type, "WW4")) {
-		*ptype = "WW4";
-		mutex_lock_fn = ww4_mutex_lock;
-		mutex_unlock_fn = ww4_mutex_unlock;
+	} else if (!strcasecmp(type, "NOU")) {
+		*ptype = "NOU";
+		mutex_lock_fn = nousermode_mutex_lock;
+		mutex_unlock_fn = nousermode_mutex_unlock;
+	} else if (!strcasecmp(type, "NOK")) {
+		*ptype = "NOK";
+		mutex_lock_fn = nokernel_mutex_lock;
+		mutex_unlock_fn = nokernel_mutex_unlock;
 	} else if (!strcasecmp(type, "PI")) {
 		*ptype = "PI";
 		mutex_lock_fn = pi_mutex_lock;
