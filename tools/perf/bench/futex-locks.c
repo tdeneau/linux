@@ -38,6 +38,16 @@ typedef u32 futex_t;
 typedef void (*lock_fn_t)(futex_t *futex, int tid);
 typedef void (*unlock_fn_t)(futex_t *futex, int tid);
 
+typedef struct mcs_lock_t mcs_lock_t;
+struct mcs_lock_t
+{
+    mcs_lock_t *next;
+    int spin;
+};
+typedef struct mcs_lock_t *mcs_lock;
+
+mcs_lock mcs_cnt_lock = NULL;
+
 
 /*
  * Statistical count list
@@ -52,6 +62,8 @@ enum {
 	STAT_TIMEOUTS,	/* # of exclusive lock timeouts		*/
 	STAT_LOCKERRS,	/* # of exclusive lock errors		*/
 	STAT_UNLKERRS,	/* # of exclusive unlock errors		*/
+	STAT_MCS_LOCKS,	    /* # for mcs only */
+	STAT_MCS_UNLOCKS,	/* # for mcs only */
 	STAT_NUM	/* Total # of statistical count		*/
 };
 
@@ -80,6 +92,7 @@ struct worker {
   u8 buf[WORKERBUFSIZE];
   u32 nextindex;
   u32 dummy;
+  mcs_lock_t  mcs_me;
   
 } __cacheline_aligned;
 
@@ -603,6 +616,80 @@ static void gc_mutex_unlock(futex_t *futex __maybe_unused,
 	pthread_mutex_unlock(&mutex);
 }
 
+
+/*************************
+ *   MCS lock routines
+ ************************/
+static inline void *xchg_64(void *ptr, void *x)
+{
+    __asm__ __volatile__("xchgq %0,%1"
+                :"=r" ((unsigned long long) x)
+                :"m" (*(volatile long long *)ptr), "0" ((unsigned long long) x)
+                :"memory");
+
+    return x;
+}
+
+#define cmpxchg64(P, O, N) __sync_val_compare_and_swap((P), (O), (N))
+
+static inline void lock_mcs(futex_t *futex __maybe_unused, int tid)
+{
+    mcs_lock_t *tail;
+	mcs_lock *m;      // global lock
+	mcs_lock_t *me;   // 
+	struct worker *w = &worker[tid];
+	
+	m = &mcs_cnt_lock;
+	me = &w->mcs_me;
+    me->next = NULL;
+    me->spin = 0;
+
+    tail = xchg_64(m, me);
+    
+    /* No one there? */
+    if (!tail) return;
+
+    /* Someone there, need to link in */
+	stat_inc(tid, STAT_MCS_LOCKS);
+    tail->next = me;
+
+    /* Make sure we do the above setting of next. */
+    barrier();
+    
+    /* Spin on my spin variable */
+    while (!me->spin) cpu_relax();
+    
+    return;
+}
+
+static inline void unlock_mcs(futex_t *futex __maybe_unused, int tid)
+{
+	mcs_lock *m;      // global lock
+	mcs_lock_t *me;   // 
+
+	struct worker *w = &worker[tid];
+	
+	m = &mcs_cnt_lock;
+	me = &w->mcs_me;
+
+    /* No successor yet? */
+    if (!me->next)
+    {
+        /* Try to atomically unlock */
+        if (cmpxchg64(m, me, NULL) == me) return;
+
+		stat_inc(tid, STAT_MCS_UNLOCKS);
+	
+        /* Wait for successor to appear */
+        while (!me->next) cpu_relax();
+    }
+
+    /* Unlock next one */
+    me->next->spin = 1; 
+}
+
+
+
 /**************************************************************************/
 
 static inline void csdelay(int n, int tid)
@@ -760,6 +847,13 @@ static int futex_mutex_type(const char **ptype)
 		}
 		pthread_mutex_init(&mutex, attr);
 		mutex_inited = true;
+	} else if (!strcasecmp(type, "QS")) {
+		*ptype = "QS";
+		mutex_lock_fn = lock_mcs;
+		mutex_unlock_fn = unlock_mcs;
+
+		mcs_cnt_lock = NULL;      // global control lock
+
 	} else if (!strcasecmp(type, "NONE")) {
 		*ptype = "NONE";
 		mutex_lock_fn = null_mutex_lock;
@@ -794,6 +888,8 @@ static void futex_test_driver(const char *futex_type,
 		[STAT_TIMEOUTS]	 = "Exclusive lock timeouts",
 		[STAT_LOCKERRS]  = "\nExclusive lock errors",
 		[STAT_UNLKERRS]  = "\nExclusive unlock errors",
+		[STAT_MCS_LOCKS]  = "\nMCS lock slowpaths",
+		[STAT_MCS_UNLOCKS]  = "\nMCS unlock slowpaths",
 	};
 
 	if (exit_now)
