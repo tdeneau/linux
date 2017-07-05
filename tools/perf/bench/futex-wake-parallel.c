@@ -30,7 +30,7 @@ struct thread_data {
 	struct timeval runtime;
 };
 
-static unsigned int nwakes = 1;
+static unsigned int nwakes = 0;
 
 /* all threads will block on the same futex -- hash bucket chaos ;) */
 static u_int32_t futex = 0;
@@ -49,6 +49,7 @@ static const struct option options[] = {
 	OPT_UINTEGER('w', "nwakers", &nwaking_threads, "Specify amount of waking threads"),
 	OPT_BOOLEAN( 's', "silent",  &silent,   "Silent mode: do not display data/details"),
 	OPT_BOOLEAN( 'S', "shared",  &fshared,  "Use shared futexes instead of private ones"),
+	OPT_UINTEGER('W', "nwakes",  &nwakes,   "Specify # of threads to wake up on each call (default 1)"),
 	OPT_END()
 };
 
@@ -61,14 +62,18 @@ static void *waking_workerfn(void *arg)
 {
 	struct thread_data *waker = (struct thread_data *) arg;
 	struct timeval start, end;
-
+	u32 woken;
+	
 	gettimeofday(&start, NULL);
 
-	waker->nwoken = futex_wake(&futex, nwakes, futex_flag);
-	if (waker->nwoken != nwakes)
-		warnx("couldn't wakeup all tasks (%d/%d)",
-		      waker->nwoken, nwakes);
-
+	waker->nwoken = 0;
+	while (waker->nwoken < nblocked_threads/nwaking_threads) {
+	  woken = futex_wake(&futex, nwakes, futex_flag);
+	  if (woken != nwakes) {
+		warnx("couldn't wakeup all tasks (%d/%d)", woken, nwakes);
+	  }
+	  waker->nwoken += woken;
+	}
 	gettimeofday(&end, NULL);
 	timersub(&end, &start, &waker->runtime);
 
@@ -229,8 +234,11 @@ int bench_futex_wake_parallel(int argc, const char **argv,
 	/*
 	 * Each thread will wakeup nwakes tasks in
 	 * a single futex_wait call.
+	 * by default, all the threads assigned to it at once.
 	 */
-	nwakes = nblocked_threads/nwaking_threads;
+	if (nwakes == 0) {
+	  nwakes = nblocked_threads/nwaking_threads;
+	}
 
 	blocked_worker = calloc(nblocked_threads, sizeof(*blocked_worker));
 	if (!blocked_worker)
@@ -240,9 +248,9 @@ int bench_futex_wake_parallel(int argc, const char **argv,
 		futex_flag = FUTEX_PRIVATE_FLAG;
 
 	printf("Run summary [PID %d]: blocking on %d threads (at [%s] "
-	       "futex %p), %d threads waking up %d at a time.\n\n",
+	       "futex %p), %d threads each waking up %d threads, %d at a time.\n\n",
 	       getpid(), nblocked_threads, fshared ? "shared":"private",
-	       &futex, nwaking_threads, nwakes);
+	       &futex, nwaking_threads, nblocked_threads/nwaking_threads, nwakes);
 
 	init_stats(&wakeup_stats);
 	init_stats(&waketime_stats);

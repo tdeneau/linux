@@ -30,4 +30,4 @@ if [ $? -eq 0 ]; then
 fi
 export USE_COLOR
 
-(cd functional; ./run.sh)
+(cd functional; bash -x ./run.sh)
