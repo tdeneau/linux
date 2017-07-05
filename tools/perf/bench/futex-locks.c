@@ -89,7 +89,7 @@ struct worker {
 	 * Lock/unlock times
 	 */
 	u64 times[TIME_NUM];
-  u8 buf[WORKERBUFSIZE];
+  u8  *buf;    // allocated to be local by each thread
   u32 nextindex;
   u32 dummy;
   mcs_lock_t  mcs_me;
@@ -758,6 +758,13 @@ static void *mutex_workerfn(void *arg)
 	thread_id = gettid();
 	counter = 0;
 
+	// allocate my buffer used in csdelay
+	// and touch it
+	w->buf = malloc(WORKERBUFSIZE);
+	for (int n=0; n<WORKERBUFSIZE; n+=64) {
+	  w->buf[n] = 0;
+	}
+	
 	atomic_dec_return(&threads_starting);
 
 	/*
