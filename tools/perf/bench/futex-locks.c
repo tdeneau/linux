@@ -533,6 +533,11 @@ static void nokernel_mutex_lock(futex_t *futex, int tid)
 	if (tries > 0) {
 	  stat_add(tid, STAT_LOCKS, tries);
 	}
+
+	if (tries >= cmpxchg_limit) {
+	  stat_inc(tid, STAT_LOCKERRS);
+	}
+	
 }
 
 static void nokernel_mutex_unlock(futex_t *futex, int tid)
@@ -1053,6 +1058,11 @@ int bench_futex_mutex(int argc, const char **argv,
 	if (argc)
 		goto err;
 
+	// hack to support NOU "lock" type which needs a timeout
+	// otherwise it hangs
+	if (!strcmp(ftype, "NOU") && timeout == 0) {
+	  timeout = 100000;
+	}
 	ncpus = sysconf(_SC_NPROCESSORS_ONLN);
 
 	sigfillset(&act.sa_mask);
