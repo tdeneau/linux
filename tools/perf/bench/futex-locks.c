@@ -64,7 +64,9 @@ enum {
 	STAT_UNLKERRS,	/* # of exclusive unlock errors		*/
 	STAT_MCS_LOCKS,	    /* # for mcs only */
 	STAT_MCS_UNLOCKS,	/* # for mcs only */
-	STAT_NUM	/* Total # of statistical count		*/
+	STAT_FUTEX_WAIT_CALLS, 
+	STAT_LOCKS_SUCC2, /* # of locks that took slowpath but did not call futex wait */
+	STAT_NUM	      /* Total # of statistical count		*/
 };
 
 /*
@@ -311,7 +313,8 @@ static void ww_mutex_lock(futex_t *futex, int tid)
 {
 	futex_t val = 0;
 	int ret;
-
+	int futwaits = 0;
+	
 	if (atomic_cmpxchg_acquire(futex, &val, 1))
 		return;
 
@@ -322,9 +325,15 @@ static void ww_mutex_lock(futex_t *futex, int tid)
 			 * Force value to 2 to indicate waiter
 			 */
 			val = atomic_xchg_acquire(futex, 2);
-			if (val == 0)
-				return;
+			if (val == 0) {
+			  if (futwaits == 0) {
+			    stat_inc(tid, STAT_LOCKS_SUCC2);
+			  }
+			  stat_add(tid, STAT_FUTEX_WAIT_CALLS, futwaits);
+			  return;
+			}
 		}
+		futwaits++;
 		FUTEX_CALL(futex_wait, TIME_LOCK, futex, 2, ptospec, flags);
 
 		if (ret < 0) {
@@ -365,7 +374,8 @@ static void ww2_mutex_lock(futex_t *futex, int tid)
 {
 	futex_t val = 0;
 	int ret;
-
+	int futwaits = 0;
+	
 	if (atomic_cmpxchg_acquire(futex, &val, thread_id))
 		return;
 
@@ -376,9 +386,13 @@ static void ww2_mutex_lock(futex_t *futex, int tid)
 		 */
 		while (!(val & FUTEX_WAITERS)) {
 			if (!val) {
-				if (atomic_cmpxchg_acquire(futex, &val,
-							   thread_id))
+				if (atomic_cmpxchg_acquire(futex, &val, thread_id)) {
+				    if (futwaits == 0) {
+					  stat_inc(tid, STAT_LOCKS_SUCC2);
+					}
+					stat_add(tid, STAT_FUTEX_WAIT_CALLS, futwaits);
 					return;
+				}
 				continue;
 			}
 			if (atomic_cmpxchg_acquire(futex, &val,
@@ -388,6 +402,7 @@ static void ww2_mutex_lock(futex_t *futex, int tid)
 			}
 		}
 
+		futwaits++;
 		FUTEX_CALL(futex_wait, TIME_LOCK, futex, val, ptospec, flags);
 		if (ret < 0) {
 			if (errno == EAGAIN)
@@ -902,6 +917,8 @@ static void futex_test_driver(const char *futex_type,
 		[STAT_UNLKERRS]  = "\nExclusive unlock errors",
 		[STAT_MCS_LOCKS]  = "\nMCS lock slowpaths",
 		[STAT_MCS_UNLOCKS]  = "\nMCS unlock slowpaths",
+		[STAT_FUTEX_WAIT_CALLS]  = "Futex Wait Calls",
+		[STAT_LOCKS_SUCC2]  = "Slowpaths w/no futex waits",
 	};
 
 	if (exit_now)
@@ -1003,7 +1020,7 @@ print_stat:
 	printf("%-28s = %'.2fs\n", "Test run time", (double)us/1000000);
 	for (i = 0; i < STAT_NUM; i++)
 		if (total.stats[i])
-			printf("%-28s = %'d\n", desc[i], total.stats[i]);
+			printf("%-28s = %'12d\n", desc[i], total.stats[i]);
 
 	if (timestat && total.times[TIME_LOCK]) {
 		printf("\nSyscall times:\n");
