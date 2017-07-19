@@ -30,7 +30,6 @@
 #include <sys/time.h>
 
 #define CACHELINE_SIZE		64
-#define WORKERBUFSIZE 128*1024
 #define gettid()		syscall(SYS_gettid)
 #define __cacheline_aligned	__attribute__((__aligned__(CACHELINE_SIZE)))
 
@@ -119,6 +118,7 @@ static int locklat = 1;
 static int wratio;
 static int bufstep = 64;
 static int cmpxchg_limit = 1;
+static int workerBufSizeInKB = 128;  // size in KB of worker buf
 struct timeval start, end, runtime;
 struct timespec *ptospec = NULL;
 struct timespec tospec;
@@ -128,6 +128,8 @@ static unsigned int threads_stopping;
 static struct stats throughput_stats;
 static lock_fn_t mutex_lock_fn;
 static unlock_fn_t mutex_unlock_fn;
+static u32 WORKERBUFSIZE;
+static int delayPolicy;
 
 /*
  * Glibc mutex
@@ -215,6 +217,8 @@ static const struct option mutex_options[] = {
 	OPT_INTEGER ('w', "wait-ratio", &wratio,   "Specify <n>/1024 of load is 1us sleep, default = 0"),
 	OPT_INTEGER ('b', "bufstep",    &bufstep,  "Step size in bytes thru buffer during delays, default = 64"),
 	OPT_INTEGER ('x', "cmpxchg-limit",    &cmpxchg_limit,  "limit to number of cmpxchgs in nokernel_lock"),
+	OPT_INTEGER ('B', "worker-buf-size", &workerBufSizeInKB, "size in KB of worker buffer used in csdelay"),
+	OPT_INTEGER ('D', "delay-policy", &delayPolicy, "type of delay loop to use in csdelay"),
 	OPT_END()
 };
 
@@ -395,8 +399,7 @@ static void ww2_mutex_lock(futex_t *futex, int tid)
 				}
 				continue;
 			}
-			if (atomic_cmpxchg_acquire(futex, &val,
-						   val | FUTEX_WAITERS)) {
+			if (atomic_cmpxchg_acquire(futex, &val, val | FUTEX_WAITERS)) {
 				val |= FUTEX_WAITERS;
 				break;
 			}
@@ -716,23 +719,32 @@ static inline void csdelay(int n, int tid)
 {
   struct worker *w = &worker[tid];
   u32 sum = 0;
-  while (n-- > 0) {
-	sum += w->buf[w->nextindex];
-	w->nextindex += bufstep;
-	if (w->nextindex > WORKERBUFSIZE) {
-	  w->nextindex = 0;
+
+  if (delayPolicy == 0) {
+	while (n-- > 0) {
+	  sum += w->buf[w->nextindex];
+	  w->nextindex += bufstep;
+	  if (w->nextindex > WORKERBUFSIZE) {
+		w->nextindex = 0;
+	  }
 	}
   }
-  w->dummy = sum;
-
-#if 0
-  volatile int i = 0;
-  volatile __maybe_unused int j;
-	while (n > 0) {
-	  i--;
-	  n -= 2;
+  else {
+	// this policy avoids loads and stores during the loop
+	// and so runs faster (one should adjust -d and -l times accordingly)
+	u8 *pbuf = w->buf;
+	u32 idx = w->nextindex;
+  
+	while (n-- > 0) {
+	  sum += pbuf[idx];
+	  idx += bufstep;
+	  if (idx > WORKERBUFSIZE) {
+		idx = 0;
+	  }
 	}
-#endif
+	w->nextindex = idx;
+  }
+  w->dummy = sum;
 }
 
 /*
@@ -781,7 +793,7 @@ static void *mutex_workerfn(void *arg)
 	// allocate my buffer used in csdelay
 	// and touch it
 	w->buf = malloc(WORKERBUFSIZE);
-	for (int n=0; n<WORKERBUFSIZE; n+=64) {
+	for (u32 n=0; n<WORKERBUFSIZE; n+=64) {
 	  w->buf[n] = 0;
 	}
 	
@@ -933,6 +945,8 @@ static void futex_test_driver(const char *futex_type,
 	printf("[PID %d]: %d threads doing %s futex lockings (load=%d) for %d secs.\n\n",
 	       getpid(), nthreads, futex_type, loadlat, nsecs);
 
+	// printf("... worker buf size %dKB\n", workerBufSizeInKB);
+
 	init_stats(&throughput_stats);
 
 	*pfutex = 0;
@@ -1080,6 +1094,8 @@ int bench_futex_mutex(int argc, const char **argv,
 	if (!strcmp(ftype, "NOU") && timeout == 0) {
 	  timeout = 100000;
 	}
+	WORKERBUFSIZE = workerBufSizeInKB * 1024;
+
 	ncpus = sysconf(_SC_NPROCESSORS_ONLN);
 
 	sigfillset(&act.sa_mask);
