@@ -94,7 +94,7 @@ struct worker {
   u32 nextindex;
   u32 dummy;
   mcs_lock_t  mcs_me;
-  
+  u32 randseed;
 } __cacheline_aligned;
 
 /*
@@ -113,8 +113,11 @@ static bool verbose, done, fshared, exit_now, timestat;
 static unsigned int ncpus, nthreads;
 static int flags;
 static const char *ftype;
+static const char *locklatStr;
+
+static int locklatLo = 1;
+static int locklatHi = 0;
 static int loadlat = 1;
-static int locklat = 1;
 static int wratio;
 static int bufstep = 64;
 static int cmpxchg_limit = 1;
@@ -129,7 +132,7 @@ static struct stats throughput_stats;
 static lock_fn_t mutex_lock_fn;
 static unlock_fn_t mutex_unlock_fn;
 static u32 WORKERBUFSIZE;
-static int delayPolicy;
+static int delayPolicy = 1;  // policy 1 (do some stores but not stlf) is default for now
 
 /*
  * Glibc mutex
@@ -205,7 +208,7 @@ static inline void stat_inc(int tid __maybe_unused, int item __maybe_unused)
  * issued.
  */
 static const struct option mutex_options[] = {
-	OPT_INTEGER ('d', "locklat",	&locklat,  "Specify inter-locking latency (default = 1)"),
+    OPT_STRING  ('d', "locklat",	&locklatStr, "int", "Specify inter-locking latency, supports random within range (default = 1)"),
 	OPT_STRING  ('f', "ftype",	&ftype,    "type", "Specify futex type: WW, PI, GC, all (default)"),
 	OPT_INTEGER ('l', "loadlat",	&loadlat,  "Specify load latency (default = 1)"),
 	OPT_UINTEGER('r', "runtime",	&nsecs,    "Specify runtime (in seconds, default = 10s)"),
@@ -714,6 +717,7 @@ static inline void unlock_mcs(futex_t *futex __maybe_unused, int tid)
 
 
 /**************************************************************************/
+#define gen10(n)  n;n;n;n;n;n;n;n;n;n;
 
 static inline void csdelay(int n, int tid)
 {
@@ -728,8 +732,9 @@ static inline void csdelay(int n, int tid)
 		w->nextindex = 0;
 	  }
 	}
+	w->dummy = sum;
   }
-  else {
+  else if (delayPolicy == 1) {
 	// this policy avoids loads and stores during the loop
 	// and so runs faster (one should adjust -d and -l times accordingly)
 	u8 *pbuf = w->buf;
@@ -743,8 +748,16 @@ static inline void csdelay(int n, int tid)
 	  }
 	}
 	w->nextindex = idx;
+    w->dummy = sum;
   }
-  w->dummy = sum;
+  else if (delayPolicy == 2) {
+	while (n-- > 0) {
+	  gen10(asm("nop"));
+	  gen10(asm("nop"));
+	  gen10(asm("nop"));
+	}
+  }
+  
 }
 
 /*
@@ -806,10 +819,19 @@ static void *mutex_workerfn(void *arg)
 		cpu_relax();
 
 	do {
+        int locklat;
 		lock_fn(w->futex, tid);
 		load(tid);
 		unlock_fn(w->futex, tid);
 		w->stats[STAT_OPS]++;	/* One more locking operation */
+		if (locklatHi == 0) {
+		  locklat = locklatLo;
+		}
+		else {
+		  // generate a random value between locklatLo and locklatHi
+		  int randval = rand_r(&w->randseed);
+		  locklat = locklatLo + (randval % (locklatHi - locklatLo));
+		}
 		csdelay(locklat, tid);
 	}  while (!done);
 	
@@ -832,6 +854,8 @@ static void create_threads(struct worker *w, pthread_attr_t *thread_attr,
 	w->futex = pfutex;
 	w->nextindex = 0;
 
+	w->randseed = tid + 100;
+	
 #if 0
 	if (pthread_attr_setaffinity_np(thread_attr, sizeof(cpu_set_t), &cpu))
 		err(EXIT_FAILURE, "pthread_attr_setaffinity_np");
@@ -942,8 +966,8 @@ static void futex_test_driver(const char *futex_type,
 	}
 
 	printf("\n=====================================\n");
-	printf("[PID %d]: %d threads doing %s futex lockings (load=%d) for %d secs.\n\n",
-	       getpid(), nthreads, futex_type, loadlat, nsecs);
+	printf("[PID %d]: %d threads doing %s futex lockings (load=%d) (locklat=%s) for %d secs.\n\n",
+	       getpid(), nthreads, futex_type, loadlat, locklatStr, nsecs);
 
 	// printf("... worker buf size %dKB\n", workerBufSizeInKB);
 
@@ -1083,7 +1107,8 @@ int bench_futex_mutex(int argc, const char **argv,
 		      const char *prefix __maybe_unused)
 {
 	struct sigaction act;
-
+	char *psep;
+	
 	argc = parse_options(argc, argv, mutex_options,
 			     bench_futex_mutex_usage, 0);
 	if (argc)
@@ -1094,6 +1119,24 @@ int bench_futex_mutex(int argc, const char **argv,
 	if (!strcmp(ftype, "NOU") && timeout == 0) {
 	  timeout = 100000;
 	}
+
+	// decode locklat in case range specified
+	
+	psep = strchr(locklatStr, '-');
+	if (psep == NULL) {
+	  // single value
+	  locklatLo = atoi(locklatStr);
+	  locklatHi = 0;
+	}
+	else {
+	  // two values
+	  const char * str2 = psep + 1;
+	  *psep = '\0';
+	  locklatLo = atoi(locklatStr);
+	  locklatHi = atoi(str2);
+	  *psep = '-';
+	}
+
 	WORKERBUFSIZE = workerBufSizeInKB * 1024;
 
 	ncpus = sysconf(_SC_NPROCESSORS_ONLN);
