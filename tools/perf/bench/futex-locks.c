@@ -114,6 +114,7 @@ static unsigned int ncpus, nthreads;
 static int flags;
 static const char *ftype;
 static const char *locklatStr;
+static bool noThreadAffinity = false;
 
 static int locklatLo = 1;
 static int locklatHi = 0;
@@ -222,6 +223,7 @@ static const struct option mutex_options[] = {
 	OPT_INTEGER ('x', "cmpxchg-limit",    &cmpxchg_limit,  "limit to number of cmpxchgs in nokernel_lock"),
 	OPT_INTEGER ('B', "worker-buf-size", &workerBufSizeInKB, "size in KB of worker buffer used in csdelay"),
 	OPT_INTEGER ('D', "delay-policy", &delayPolicy, "type of delay loop to use in csdelay"),
+	OPT_BOOLEAN ('A', "noThreadAffinity",	&noThreadAffinity,  "set to avoid affinitizing threads to one cpu"),
 	OPT_END()
 };
 
@@ -718,6 +720,7 @@ static inline void unlock_mcs(futex_t *futex __maybe_unused, int tid)
 
 /**************************************************************************/
 #define gen10(n)  n;n;n;n;n;n;n;n;n;n;
+#define gen5(n)   n;n;n;n;n;
 
 static inline void csdelay(int n, int tid)
 {
@@ -753,8 +756,7 @@ static inline void csdelay(int n, int tid)
   else if (delayPolicy == 2) {
 	while (n-- > 0) {
 	  gen10(asm("nop"));
-	  gen10(asm("nop"));
-	  gen10(asm("nop"));
+	  gen5(asm("nop"));
 	}
   }
   
@@ -841,22 +843,51 @@ static void *mutex_workerfn(void *arg)
 	return NULL;
 }
 
+int *cpulist;
+int cpulistCount;
+cpu_set_t cpuSetAll;
+
+static void build_cpu_list(void)
+{
+  int idx, n;
+  
+  CPU_ZERO(&cpuSetAll);
+  sched_getaffinity(getpid(), sizeof(cpu_set_t), &cpuSetAll);
+  cpulistCount = CPU_COUNT(&cpuSetAll);
+  cpulist = malloc(cpulistCount * sizeof(int));
+  idx = 0;
+  printf("cpulist: ");
+  for (n=0; (n < CPU_SETSIZE) && (idx < cpulistCount); n++) {
+	if (CPU_ISSET(n, &cpuSetAll)) {
+	  cpulist[idx++] = n;
+	  printf("%d, ", n);
+	}
+  }
+  printf("\n");
+}
+
 static void create_threads(struct worker *w, pthread_attr_t *thread_attr,
 			   void *(*workerfn)(void *arg), long tid)
 {
 	cpu_set_t cpu;
-
 	/*
 	 * Bind each thread to a CPU
 	 */
-	CPU_ZERO(&cpu);
-	CPU_SET(tid % ncpus, &cpu);
+	// CPU_ZERO(&cpu);
+	// CPU_SET(tid % ncpus, &cpu);
 	w->futex = pfutex;
 	w->nextindex = 0;
 
 	w->randseed = tid + 100;
-	
-#if 0
+
+#if 1
+	CPU_ZERO(&cpu);
+	if (0) {
+	  CPU_SET(cpulist[tid % cpulistCount], &cpu);
+	}
+	else {
+	  cpu = cpuSetAll;
+	}
 	if (pthread_attr_setaffinity_np(thread_attr, sizeof(cpu_set_t), &cpu))
 		err(EXIT_FAILURE, "pthread_attr_setaffinity_np");
 #endif
@@ -978,6 +1009,7 @@ static void futex_test_driver(const char *futex_type,
 	threads_starting = nthreads;
 	pthread_attr_init(&thread_attr);
 
+	build_cpu_list();
 	for (i = 0; i < (int)nthreads; i++)
 		create_threads(&worker[i], &thread_attr, workerfn, i);
 
@@ -1140,7 +1172,8 @@ int bench_futex_mutex(int argc, const char **argv,
 	WORKERBUFSIZE = workerBufSizeInKB * 1024;
 
 	ncpus = sysconf(_SC_NPROCESSORS_ONLN);
-
+	printf("ncpus=%d\n", ncpus);
+	
 	sigfillset(&act.sa_mask);
 	act.sa_sigaction = toggle_done;
 	sigaction(SIGINT, &act, NULL);
