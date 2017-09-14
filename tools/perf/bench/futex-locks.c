@@ -30,7 +30,7 @@
 #include <sys/time.h>
 
 #define CACHELINE_SIZE		64
-#define gettid()		syscall(SYS_gettid)
+
 #define __cacheline_aligned	__attribute__((__aligned__(CACHELINE_SIZE)))
 
 typedef u32 futex_t;
@@ -65,6 +65,7 @@ enum {
 	STAT_MCS_UNLOCKS,	/* # for mcs only */
 	STAT_FUTEX_WAIT_CALLS, 
 	STAT_LOCKS_SUCC2, /* # of locks that took slowpath but did not call futex wait */
+	STAT_GETTID,      /* for minimum syscall timing */
 	STAT_NUM	      /* Total # of statistical count		*/
 };
 
@@ -74,6 +75,7 @@ enum {
 enum {
 	TIME_LOCK,	/* Total exclusive lock syscall time	*/
 	TIME_UNLK,	/* Total exclusive unlock syscall time	*/
+	TIME_GETTID, /* for minimum syscall timing */
 	TIME_NUM,
 };
 
@@ -114,7 +116,6 @@ static unsigned int ncpus, nthreads;
 static int flags;
 static const char *ftype;
 static const char *locklatStr;
-static bool noThreadAffinity = false;
 
 static int locklatLo = 1;
 static int locklatHi = 0;
@@ -134,6 +135,7 @@ static lock_fn_t mutex_lock_fn;
 static unlock_fn_t mutex_unlock_fn;
 static u32 WORKERBUFSIZE;
 static int delayPolicy = 1;  // policy 1 (do some stores but not stlf) is default for now
+static int affinityPolicy = 0;
 
 /*
  * Glibc mutex
@@ -158,6 +160,21 @@ static inline double stat_percent(struct worker *w, int top, int bottom)
 {
 	return (double)w->stats[top] * 100 / w->stats[bottom];
 }
+
+static pid_t gettid(long tid) {
+  pid_t rettid;
+  if (unlikely(timestat)) {
+	struct timespec stime;
+	clock_gettime(CLOCK_REALTIME, &stime);
+	rettid = syscall(SYS_gettid);
+	compute_systime(tid, TIME_GETTID, &stime);
+  } else {
+	rettid = syscall(SYS_gettid);
+  }
+  return rettid;
+}
+
+
 
 /*
  * Macro for syscall time computation
@@ -223,7 +240,7 @@ static const struct option mutex_options[] = {
 	OPT_INTEGER ('x', "cmpxchg-limit",    &cmpxchg_limit,  "limit to number of cmpxchgs in nokernel_lock"),
 	OPT_INTEGER ('B', "worker-buf-size", &workerBufSizeInKB, "size in KB of worker buffer used in csdelay"),
 	OPT_INTEGER ('D', "delay-policy", &delayPolicy, "type of delay loop to use in csdelay"),
-	OPT_BOOLEAN ('A', "noThreadAffinity",	&noThreadAffinity,  "set to avoid affinitizing threads to one cpu"),
+	OPT_INTEGER ('A', "affinity-policy",  &affinityPolicy,  "0 = do not call pthread_set_affinity, 1 = aff each thr to 1 cpu in affinity set, 2 = affinitize to sequential cpus"),
 	OPT_END()
 };
 
@@ -802,7 +819,10 @@ static void *mutex_workerfn(void *arg)
 	unlock_fn_t unlock_fn = mutex_unlock_fn;
 	// u32 ops_count = 0;
 
-	thread_id = gettid();
+	for (int i=0; i<1000; i++) {
+	  thread_id = gettid(tid);
+	  stat_inc(tid, STAT_GETTID);
+	}
 	counter = 0;
 
 	// allocate my buffer used in csdelay
@@ -871,7 +891,7 @@ static void create_threads(struct worker *w, pthread_attr_t *thread_attr,
 {
 	cpu_set_t cpu;
 	/*
-	 * Bind each thread to a CPU
+	 * Bind each thread as required by affinityPolicy
 	 */
 	// CPU_ZERO(&cpu);
 	// CPU_SET(tid % ncpus, &cpu);
@@ -880,17 +900,19 @@ static void create_threads(struct worker *w, pthread_attr_t *thread_attr,
 
 	w->randseed = tid + 100;
 
-#if 1
 	CPU_ZERO(&cpu);
-	if (0) {
+	if (affinityPolicy == 1) {
+	  // not sure pinning to 1 cpu makes any difference but it was easy to implement
 	  CPU_SET(cpulist[tid % cpulistCount], &cpu);
 	}
-	else {
-	  cpu = cpuSetAll;
+	else if (affinityPolicy == 2) {
+	  // this was the original policy which you could also emulate by using the right numactl -C
+	  CPU_SET(tid % ncpus, &cpu);
 	}
-	if (pthread_attr_setaffinity_np(thread_attr, sizeof(cpu_set_t), &cpu))
+	if (affinityPolicy != 0) {
+	  if (pthread_attr_setaffinity_np(thread_attr, sizeof(cpu_set_t), &cpu))
 		err(EXIT_FAILURE, "pthread_attr_setaffinity_np");
-#endif
+	}
 	
 	if (pthread_create(&w->thread, thread_attr, workerfn, (void *)tid))
 		err(EXIT_FAILURE, "pthread_create");
@@ -986,6 +1008,7 @@ static void futex_test_driver(const char *futex_type,
 		[STAT_MCS_UNLOCKS]  = "\nMCS unlock slowpaths",
 		[STAT_FUTEX_WAIT_CALLS]  = "Futex Wait Calls",
 		[STAT_LOCKS_SUCC2]  = "Slowpaths w/no futex waits",
+		[STAT_GETTID] = "gettid",
 	};
 
 	if (exit_now)
@@ -1077,6 +1100,9 @@ print_stat:
 		for (j = 0; j < STAT_NUM; j++)
 			total.stats[j] += worker[i].stats[j];
 
+		for (j = 0; j < TIME_NUM; j++)
+		  total.times[j] += worker[i].times[j];
+
 		update_stats(&throughput_stats, tp);
 		if (verbose)
 			printf("[thread %3d] futex: %p [ %'ld ops/sec ]\n",
@@ -1100,6 +1126,9 @@ print_stat:
 		if (total.stats[STAT_UNLOCKS])
 			printf("Avg exclusive unlock syscall = %'ldns\n",
 			    total.times[TIME_UNLK]/total.stats[STAT_UNLOCKS]);
+		if (total.stats[STAT_GETTID])
+			printf("Avg gettid syscall = %'ldns\n",
+			    total.times[TIME_GETTID]/total.stats[STAT_GETTID]);
 	}
 
 	printf("\nPercentages:\n");

@@ -38,6 +38,7 @@ static pthread_mutex_t thread_lock;
 static unsigned int threads_starting;
 static struct stats throughput_stats;
 static pthread_cond_t thread_parent, thread_worker;
+static int affinityPolicy = 0;
 
 struct worker {
 	int tid;
@@ -52,6 +53,7 @@ static const struct option options[] = {
 	OPT_UINTEGER('f', "futexes", &nfutexes, "Specify amount of futexes per threads"),
 	OPT_BOOLEAN( 's', "silent",  &silent,   "Silent mode: do not display data/details"),
 	OPT_BOOLEAN( 'S', "shared",  &fshared,  "Use shared futexes instead of private ones"),
+	OPT_INTEGER ('A', "affinity-policy",  &affinityPolicy,  "0 = do not call pthread_set_affinity, 1 = affinitize to sequential cpus"),
 	OPT_END()
 };
 
@@ -162,12 +164,14 @@ int bench_futex_hash(int argc, const char **argv,
 		if (!worker[i].futex)
 			goto errmem;
 
-		CPU_ZERO(&cpu);
-		CPU_SET(i % ncpus, &cpu);
+		if (affinityPolicy != 0) {
+		  CPU_ZERO(&cpu);
+		  CPU_SET(i % ncpus, &cpu);
 
-		ret = pthread_attr_setaffinity_np(&thread_attr, sizeof(cpu_set_t), &cpu);
-		if (ret)
+		  ret = pthread_attr_setaffinity_np(&thread_attr, sizeof(cpu_set_t), &cpu);
+		  if (ret)
 			err(EXIT_FAILURE, "pthread_attr_setaffinity_np");
+		}
 
 		ret = pthread_create(&worker[i].thread, &thread_attr, workerfn,
 				     (void *)(struct worker *) &worker[i]);
