@@ -136,7 +136,7 @@ static unlock_fn_t mutex_unlock_fn;
 static u32 WORKERBUFSIZE;
 static int delayPolicy = 1;  // policy 1 (do some stores but not stlf) is default for now
 static int affinityPolicy = 0;
-
+static int lockCountStop = 0;  // if set, stop after this many lock ops each thread
 /*
  * Glibc mutex
  */
@@ -241,6 +241,7 @@ static const struct option mutex_options[] = {
 	OPT_INTEGER ('B', "worker-buf-size", &workerBufSizeInKB, "size in KB of worker buffer used in csdelay"),
 	OPT_INTEGER ('D', "delay-policy", &delayPolicy, "type of delay loop to use in csdelay"),
 	OPT_INTEGER ('A', "affinity-policy",  &affinityPolicy,  "0 = do not call pthread_set_affinity, 1 = aff each thr to 1 cpu in affinity set, 2 = affinitize to sequential cpus"),
+	OPT_INTEGER ('C', "lock-count-stop",  &lockCountStop,  "if set, stop after this many lock ops each thread"),
 	OPT_END()
 };
 
@@ -819,7 +820,7 @@ static void *mutex_workerfn(void *arg)
 	unlock_fn_t unlock_fn = mutex_unlock_fn;
 	// u32 ops_count = 0;
 
-	for (int i=0; i<1000; i++) {
+	for (int i=0; i<1; i++) {
 	  thread_id = gettid(tid);
 	  stat_inc(tid, STAT_GETTID);
 	}
@@ -846,6 +847,9 @@ static void *mutex_workerfn(void *arg)
 		load(tid);
 		unlock_fn(w->futex, tid);
 		w->stats[STAT_OPS]++;	/* One more locking operation */
+		if ((lockCountStop > 0) && (w->stats[STAT_OPS] >= (u32) lockCountStop)) {
+		  break;
+		}
 		if (locklatHi == 0) {
 		  locklat = locklatLo;
 		}
@@ -1050,14 +1054,17 @@ static void futex_test_driver(const char *futex_type,
 	 * simultaineously.
 	 */
 	atomic_inc_return(&worker_start);
-	sleep(nsecs);
-	toggle_done(0, NULL, NULL);
+	// avoid sleep if using lockCountStop
+	if (lockCountStop == 0) {
+	  sleep(nsecs);
+	  toggle_done(0, NULL, NULL);
+	}
 
 	/*
 	 * In verbose mode, we check if all the threads have been stopped
 	 * after 1ms and report the status if some are still running.
 	 */
-	if (verbose) {
+	if (verbose && (lockCountStop == 0)) {
 		usleep(1000);
 		if (threads_stopping != nthreads) {
 			printf("%d threads still running 1ms after timeout"
@@ -1084,6 +1091,11 @@ static void futex_test_driver(const char *futex_type,
 
 		if (ret)
 			err(EXIT_FAILURE, "pthread_join");
+	}
+
+	// in lockCountStop mode, we compute runtime here
+	if (lockCountStop > 0) {
+	  toggle_done(0, NULL, NULL);
 	}
 
 print_stat:
