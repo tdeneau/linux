@@ -97,6 +97,8 @@ struct worker {
   u32 dummy;
   mcs_lock_t  mcs_me;
   u32 randseed;
+  pthread_mutex_t *pmutex; // points to either global or private
+  pthread_mutex_t mutex;  // used for private mutexes
 } __cacheline_aligned;
 
 /*
@@ -137,6 +139,8 @@ static u32 WORKERBUFSIZE;
 static int delayPolicy = 1;  // policy 1 (do some stores but not stlf) is default for now
 static int affinityPolicy = 0;
 static int lockCountStop = 0;  // if set, stop after this many lock ops each thread
+static bool privateMutex; 
+
 /*
  * Glibc mutex
  */
@@ -242,6 +246,7 @@ static const struct option mutex_options[] = {
 	OPT_INTEGER ('D', "delay-policy", &delayPolicy, "type of delay loop to use in csdelay"),
 	OPT_INTEGER ('A', "affinity-policy",  &affinityPolicy,  "0 = do not call pthread_set_affinity, 1 = aff each thr to 1 cpu in affinity set, 2 = affinitize to sequential cpus"),
 	OPT_INTEGER ('C', "lock-count-stop",  &lockCountStop,  "if set, stop after this many lock ops each thread"),
+	OPT_BOOLEAN ('P', "private-mutex",	&privateMutex,  "if set each thread gets its own mutex, so no contention"),
 	OPT_END()
 };
 
@@ -653,13 +658,15 @@ static void null_mutex_unlock(futex_t *futex __maybe_unused, int tid __maybe_unu
 static void gc_mutex_lock(futex_t *futex __maybe_unused,
 			  int tid __maybe_unused)
 {
-	pthread_mutex_lock(&mutex);
+    struct worker *w = &worker[tid];
+	pthread_mutex_lock(w->pmutex);
 }
 
 static void gc_mutex_unlock(futex_t *futex __maybe_unused,
 			    int tid __maybe_unused)
 {
-	pthread_mutex_unlock(&mutex);
+    struct worker *w = &worker[tid];
+	pthread_mutex_unlock(w->pmutex);
 }
 
 
@@ -902,6 +909,13 @@ static void create_threads(struct worker *w, pthread_attr_t *thread_attr,
 	w->futex = pfutex;
 	w->nextindex = 0;
 
+	if (!privateMutex) {
+	  w->pmutex = &mutex;
+	}
+	else {
+	  w->pmutex = &w->mutex;
+	  pthread_mutex_init(&w->mutex, NULL);
+	}
 	w->randseed = tid + 100;
 
 	CPU_ZERO(&cpu);
