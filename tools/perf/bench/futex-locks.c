@@ -97,6 +97,7 @@ struct worker {
   u32 dummy;
   mcs_lock_t  mcs_me;
   u32 randseed;
+  int affcpu;
   pthread_mutex_t *pmutex; // points to either global or private
   pthread_mutex_t mutex;  // used for private mutexes
 } __cacheline_aligned;
@@ -140,6 +141,7 @@ static int delayPolicy = 1;  // policy 1 (do some stores but not stlf) is defaul
 static int affinityPolicy = 0;
 static int lockCountStop = 0;  // if set, stop after this many lock ops each thread
 static bool privateMutex; 
+static bool gettidMarksLock; 
 
 /*
  * Glibc mutex
@@ -244,9 +246,10 @@ static const struct option mutex_options[] = {
 	OPT_INTEGER ('x', "cmpxchg-limit",    &cmpxchg_limit,  "limit to number of cmpxchgs in nokernel_lock"),
 	OPT_INTEGER ('B', "worker-buf-size", &workerBufSizeInKB, "size in KB of worker buffer used in csdelay"),
 	OPT_INTEGER ('D', "delay-policy", &delayPolicy, "type of delay loop to use in csdelay"),
-	OPT_INTEGER ('A', "affinity-policy",  &affinityPolicy,  "0 = do not call pthread_set_affinity, 1 = aff each thr to 1 cpu in affinity set, 2 = affinitize to sequential cpus"),
+	OPT_INTEGER ('A', "affinity-policy",  &affinityPolicy,  "0 = do not call pthread_set_affinity, 1 = pthread_set_affinity each thr to 1 cpu in affinity set"),
 	OPT_INTEGER ('C', "lock-count-stop",  &lockCountStop,  "if set, stop after this many lock ops each thread"),
 	OPT_BOOLEAN ('P', "private-mutex",	&privateMutex,  "if set each thread gets its own mutex, so no contention"),
+	OPT_BOOLEAN ('G', "gettid-marks-lock",	&gettidMarksLock,  "if set, call gettid so lttng has some opmarker"),
 	OPT_END()
 };
 
@@ -853,6 +856,9 @@ static void *mutex_workerfn(void *arg)
 		lock_fn(w->futex, tid);
 		load(tid);
 		unlock_fn(w->futex, tid);
+		if (gettidMarksLock) {
+		  syscall(SYS_gettid);
+		}
 		w->stats[STAT_OPS]++;	/* One more locking operation */
 		if ((lockCountStop > 0) && (w->stats[STAT_OPS] >= (u32) lockCountStop)) {
 		  break;
@@ -919,14 +925,16 @@ static void create_threads(struct worker *w, pthread_attr_t *thread_attr,
 	w->randseed = tid + 100;
 
 	CPU_ZERO(&cpu);
+	w->affcpu = -1;    // default meaning no thread affinity
 	if (affinityPolicy == 1) {
+	  w->affcpu = cpulist[tid % cpulistCount];
 	  // not sure pinning to 1 cpu makes any difference but it was easy to implement
-	  CPU_SET(cpulist[tid % cpulistCount], &cpu);
+	  CPU_SET(w->affcpu, &cpu);
+	  // note: this was the original affinity policy (affinitize to sequential CPUs)
+	  // but you can get this result by using affinityPolicy 1 and numactl -C 0-N
+	  // CPU_SET(tid % ncpus, &cpu);
 	}
-	else if (affinityPolicy == 2) {
-	  // this was the original policy which you could also emulate by using the right numactl -C
-	  CPU_SET(tid % ncpus, &cpu);
-	}
+	
 	if (affinityPolicy != 0) {
 	  if (pthread_attr_setaffinity_np(thread_attr, sizeof(cpu_set_t), &cpu))
 		err(EXIT_FAILURE, "pthread_attr_setaffinity_np");
@@ -1041,8 +1049,6 @@ static void futex_test_driver(const char *futex_type,
 	printf("[PID %d]: %d threads doing %s futex lockings (load=%d) (locklat=%s) for %d secs.\n\n",
 	       getpid(), nthreads, futex_type, loadlat, locklatStr, nsecs);
 
-	// printf("... worker buf size %dKB\n", workerBufSizeInKB);
-
 	init_stats(&throughput_stats);
 
 	*pfutex = 0;
@@ -1130,9 +1136,14 @@ print_stat:
 		  total.times[j] += worker[i].times[j];
 
 		update_stats(&throughput_stats, tp);
-		if (verbose)
-			printf("[thread %3d] futex: %p [ %'ld ops/sec ]\n",
+		if (verbose) {
+			printf("[thread %3d] futex: %p [ %'ld ops/sec ]",
 			       i, worker[i].futex, (long)tp);
+			if (worker[i].affcpu != -1) {
+			  printf("  cpu %d", worker[i].affcpu);
+			}
+			printf("\n");
+		}
 	}
 
 	avg    = avg_stats(&throughput_stats);
