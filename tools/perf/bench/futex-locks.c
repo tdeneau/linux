@@ -28,6 +28,7 @@
 #include <err.h>
 #include <stdlib.h>
 #include <sys/time.h>
+#include <x86intrin.h>
 
 #define CACHELINE_SIZE		64
 
@@ -65,6 +66,8 @@ enum {
 	STAT_MCS_UNLOCKS,	/* # for mcs only */
 	STAT_FUTEX_WAIT_CALLS, 
 	STAT_LOCKS_SUCC2, /* # of locks that took slowpath but did not call futex wait */
+	STAT_MUTEX_LOCKS, /* calls to pthread_mutex_lock */
+	STAT_MUTEX_UNLOCKS, /* calls to pthread_mutex_unlock */
 	STAT_GETTID,      /* for minimum syscall timing */
 	STAT_NUM	      /* Total # of statistical count		*/
 };
@@ -75,6 +78,8 @@ enum {
 enum {
 	TIME_LOCK,	/* Total exclusive lock syscall time	*/
 	TIME_UNLK,	/* Total exclusive unlock syscall time	*/
+	TIME_MUTEX_LOCK,	/* Total pthread_mutex_lock time	*/
+	TIME_MUTEX_UNLK,	/* Total pthread_mutex_unlock time	*/
 	TIME_GETTID, /* for minimum syscall timing */
 	TIME_NUM,
 };
@@ -655,6 +660,33 @@ static void null_mutex_unlock(futex_t *futex __maybe_unused, int tid __maybe_unu
 {
 }
 
+
+// NOTE: used rdtsc here because using clock_gettime had too much overhead
+
+static inline void do_pthread_mutex_lock(pthread_mutex_t *mymutex, int tid __maybe_unused)
+{
+  if (unlikely(timestat)) {
+	u64 tsstart = __rdtsc();
+	pthread_mutex_lock(mymutex);
+	worker[tid].times[TIME_MUTEX_LOCK] += (__rdtsc() - tsstart);
+	stat_inc(tid, STAT_MUTEX_LOCKS);
+  } else {
+	pthread_mutex_lock(mymutex);
+  }
+}
+
+static inline void do_pthread_mutex_unlock(pthread_mutex_t *mymutex, int tid __maybe_unused)
+{
+  if (unlikely(timestat)) {
+	u64 tsstart = __rdtsc();
+	pthread_mutex_unlock(mymutex);
+	worker[tid].times[TIME_MUTEX_UNLK] += (__rdtsc() - tsstart);
+	stat_inc(tid, STAT_MUTEX_UNLOCKS);
+  } else {
+	pthread_mutex_unlock(mymutex);
+  }
+}
+
 /*
  * Glibc mutex lock and unlock function
  */
@@ -662,16 +694,15 @@ static void gc_mutex_lock(futex_t *futex __maybe_unused,
 			  int tid __maybe_unused)
 {
     struct worker *w = &worker[tid];
-	pthread_mutex_lock(w->pmutex);
+	do_pthread_mutex_lock(w->pmutex, tid);
 }
 
 static void gc_mutex_unlock(futex_t *futex __maybe_unused,
 			    int tid __maybe_unused)
 {
     struct worker *w = &worker[tid];
-	pthread_mutex_unlock(w->pmutex);
+	do_pthread_mutex_unlock(w->pmutex, tid);
 }
-
 
 /*************************
  *   MCS lock routines
@@ -978,6 +1009,7 @@ static int futex_mutex_type(const char **ptype)
 		*ptype = "GC";
 		mutex_lock_fn = gc_mutex_lock;
 		mutex_unlock_fn = gc_mutex_unlock;
+		
 		/*
 		 * Initialize pthread mutex
 		 */
@@ -1034,6 +1066,9 @@ static void futex_test_driver(const char *futex_type,
 		[STAT_MCS_UNLOCKS]  = "\nMCS unlock slowpaths",
 		[STAT_FUTEX_WAIT_CALLS]  = "Futex Wait Calls",
 		[STAT_LOCKS_SUCC2]  = "Slowpaths w/no futex waits",
+		// these two useful for glibc ftype
+		[STAT_MUTEX_LOCKS]  = "pthread_mutex_locks",
+		[STAT_MUTEX_UNLOCKS]  = "pthread_mutex_unlocks",
 		[STAT_GETTID] = "gettid",
 	};
 
@@ -1155,7 +1190,7 @@ print_stat:
 		if (total.stats[i])
 			printf("%-28s = %'12d\n", desc[i], total.stats[i]);
 
-	if (timestat && total.times[TIME_LOCK]) {
+	if (timestat && (total.times[TIME_LOCK] || total.times[TIME_MUTEX_LOCK])) {
 		printf("\nSyscall times:\n");
 		if (total.stats[STAT_LOCKS])
 			printf("Avg exclusive lock syscall   = %'ldns\n",
@@ -1163,6 +1198,12 @@ print_stat:
 		if (total.stats[STAT_UNLOCKS])
 			printf("Avg exclusive unlock syscall = %'ldns\n",
 			    total.times[TIME_UNLK]/total.stats[STAT_UNLOCKS]);
+		if (total.stats[STAT_MUTEX_LOCKS])
+			printf("Avg pthread_mutex_lock   = %'ldns\n",
+			    total.times[TIME_MUTEX_LOCK]/total.stats[STAT_MUTEX_LOCKS]);
+		if (total.stats[STAT_MUTEX_UNLOCKS])
+			printf("Avg pthread_mutex_unlock = %'ldns\n",
+			    total.times[TIME_MUTEX_UNLK]/total.stats[STAT_MUTEX_UNLOCKS]);
 		if (total.stats[STAT_GETTID])
 			printf("Avg gettid syscall = %'ldns\n",
 			    total.times[TIME_GETTID]/total.stats[STAT_GETTID]);
