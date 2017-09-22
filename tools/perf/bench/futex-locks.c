@@ -147,8 +147,9 @@ static int affinityPolicy = 0;
 static int lockCountStop = 0;  // if set, stop after this many lock ops each thread
 static bool privateMutex; 
 static bool gettidOpMarker; 
-static u64 tscFactor;
-static u64 fastpathLimit = 1500;
+static u64 tscTicksPerUs;
+static u64 fastpathLimitNs = 1000;
+static u64 fastpathLimitTicks;
 
 /*
  * Glibc mutex
@@ -257,7 +258,7 @@ static const struct option mutex_options[] = {
 	OPT_INTEGER ('C', "lock-count-stop",  &lockCountStop,  "if set, stop after this many lock ops each thread"),
 	OPT_BOOLEAN ('P', "private-mutex",	&privateMutex,  "if set each thread gets its own mutex, so no contention"),
 	OPT_BOOLEAN ('G', "gettid-marks-lock",	&gettidOpMarker,  "if set, call gettid so lttng has some opmarker"),
-	OPT_U64     ('F', "fast-path-limit",  &fastpathLimit,  "max number of cycles for fastpath"),
+	OPT_U64     ('F', "fast-path-limit",  &fastpathLimitNs,  "max number of ns for pthread_mutex fastpath"),
 	OPT_END()
 };
 
@@ -674,7 +675,7 @@ static inline void do_pthread_mutex_lock(pthread_mutex_t *mymutex, int tid __may
 	u64 tsstart = __rdtscp(&aux);
 	pthread_mutex_lock(mymutex);
 	elapsed = (__rdtscp(&aux) - tsstart);
-	if (elapsed > fastpathLimit) {
+	if (elapsed > fastpathLimitTicks) {
 	  worker[tid].times[TIME_MUTEX_LOCK] += elapsed;
 	  stat_inc(tid, STAT_MUTEX_LOCKS);
 	}
@@ -691,7 +692,7 @@ static inline void do_pthread_mutex_unlock(pthread_mutex_t *mymutex, int tid __m
 	u64 tsstart = __rdtscp(&aux);
 	pthread_mutex_unlock(mymutex);
 	elapsed = (__rdtscp(&aux) - tsstart);
-	if (elapsed > fastpathLimit) {
+	if (elapsed > fastpathLimitTicks) {
 	  worker[tid].times[TIME_MUTEX_UNLK] += elapsed;
 	  stat_inc(tid, STAT_MUTEX_UNLOCKS);
 	}
@@ -716,6 +717,8 @@ static void gc_mutex_unlock(futex_t *futex __maybe_unused,
     struct worker *w = &worker[tid];
 	do_pthread_mutex_unlock(w->pmutex, tid);
 }
+
+
 
 /*************************
  *   MCS lock routines
@@ -1212,11 +1215,11 @@ print_stat:
 			printf("Avg exclusive unlock syscall = %'ldns\n",
 			    total.times[TIME_UNLK]/total.stats[STAT_UNLOCKS]);
 		if (total.stats[STAT_MUTEX_LOCKS])
-		  printf("Avg pthread_mutex_lock > %ld ticks  = %'ld ns\n", fastpathLimit,
-				 (1000 * total.times[TIME_MUTEX_LOCK]/total.stats[STAT_MUTEX_LOCKS])/tscFactor);
+		  printf("Avg pthread_mutex_lock > %ld ns  = %'ld ns\n", fastpathLimitNs,
+				 (1000 * total.times[TIME_MUTEX_LOCK]/total.stats[STAT_MUTEX_LOCKS])/tscTicksPerUs);
 		if (total.stats[STAT_MUTEX_UNLOCKS])
-		  printf("Avg pthread_mutex_lock > %ld ticks  = %'ld ns\n", fastpathLimit,
-				   (1000 * total.times[TIME_MUTEX_UNLK]/total.stats[STAT_MUTEX_LOCKS])/tscFactor);
+		  printf("Avg pthread_mutex_lock > %ld ns  = %'ld ns\n", fastpathLimitNs,
+				   (1000 * total.times[TIME_MUTEX_UNLK]/total.stats[STAT_MUTEX_LOCKS])/tscTicksPerUs);
 		if (total.stats[STAT_GETTID])
 			printf("Avg gettid syscall = %'ldns\n",
 			    total.times[TIME_GETTID]/total.stats[STAT_GETTID]);
@@ -1235,6 +1238,12 @@ print_stat:
 	if (total.stats[STAT_WAKEUPS])
 		printf("Process wakeups              = %.1f%%\n",
 			stat_percent(&total, STAT_WAKEUPS, STAT_UNLOCKS));
+	if (total.stats[STAT_MUTEX_LOCKS])
+		printf("Pthread_mutex_lock slowpaths     = %.1f%%\n",
+			stat_percent(&total, STAT_MUTEX_LOCKS, STAT_OPS));
+	if (total.stats[STAT_MUTEX_UNLOCKS])
+		printf("Exclusive unlock slowpaths   = %.1f%%\n",
+			stat_percent(&total, STAT_MUTEX_UNLOCKS, STAT_OPS));
 
 	printf("\nPer-thread Locking Rates:\n");
 	printf("Avg = %'d ops/sec (+- %.2f%%)\n", (int)(avg + 0.5),
@@ -1255,14 +1264,14 @@ print_stat:
 	mutex_inited  = mutex_attr_inited  = false;
 }
 
-static void compute_tscFactor(void) {
+static void compute_tscTicksPerUs(void) {
   u32 aux;
   u64 tsstart, elapsed;
   tsstart = __rdtscp(&aux);
   usleep(500000);
   elapsed = __rdtscp(&aux) - tsstart;
-  tscFactor = elapsed * 2 / 1000000;
-  printf("tscFactor = %ld\n", tscFactor);
+  tscTicksPerUs = elapsed * 2 / 1000000;
+  printf("tscTicksPerUs = %ld\n", tscTicksPerUs);
 }
 
 int bench_futex_mutex(int argc, const char **argv,
@@ -1276,9 +1285,12 @@ int bench_futex_mutex(int argc, const char **argv,
 	if (argc)
 		goto err;
 
-	// compute tscFactor
-	compute_tscFactor();
+	// compute tscTicksPerUs
+	compute_tscTicksPerUs();
 
+	// get fastpathLimit in ticks
+	fastpathLimitTicks = (fastpathLimitNs * tscTicksPerUs) / 1000;
+	
 	// hack to support NOU "lock" type which needs a timeout
 	// otherwise it hangs
 	if (!strcmp(ftype, "NOU") && timeout == 0) {
