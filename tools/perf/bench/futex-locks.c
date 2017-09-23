@@ -148,8 +148,6 @@ static int lockCountStop = 0;  // if set, stop after this many lock ops each thr
 static bool privateMutex; 
 static bool gettidOpMarker; 
 static u64 tscTicksPerUs;
-static u64 fastpathLimitNs = 1000;
-static u64 fastpathLimitTicks;
 
 /*
  * Glibc mutex
@@ -258,7 +256,6 @@ static const struct option mutex_options[] = {
 	OPT_INTEGER ('C', "lock-count-stop",  &lockCountStop,  "if set, stop after this many lock ops each thread"),
 	OPT_BOOLEAN ('P', "private-mutex",	&privateMutex,  "if set each thread gets its own mutex, so no contention"),
 	OPT_BOOLEAN ('G', "gettid-marks-lock",	&gettidOpMarker,  "if set, call gettid so lttng has some opmarker"),
-	OPT_U64     ('F', "fast-path-limit",  &fastpathLimitNs,  "max number of ns for pthread_mutex fastpath"),
 	OPT_END()
 };
 
@@ -670,12 +667,21 @@ static void null_mutex_unlock(futex_t *futex __maybe_unused, int tid __maybe_unu
 static inline void do_pthread_mutex_lock(pthread_mutex_t *mymutex, int tid __maybe_unused)
 {
   if (unlikely(timestat)) {
-	u32 aux;
-	u64 elapsed;
-	u64 tsstart = __rdtscp(&aux);
-	pthread_mutex_lock(mymutex);
-	elapsed = (__rdtscp(&aux) - tsstart);
-	if (elapsed > fastpathLimitTicks) {
+	futex_t *pmyfutex = (futex_t *) &mymutex->__data.__lock;
+	futex_t val = 0;
+	// We try a cmpxchg first so we don't time things if it succeeds
+	if (atomic_cmpxchg_acquire(pmyfutex, &val, 1)) {
+	  mymutex->__data.__owner = (int) thread_id;
+	  mymutex->__data.__nusers++;
+	  return;
+	} else {
+	  // slowpath
+	  u32 aux;
+	  u64 elapsed;
+	  u64 tsstart;
+	  tsstart = __rdtscp(&aux);
+	  pthread_mutex_lock(mymutex);
+	  elapsed = (__rdtscp(&aux) - tsstart);
 	  worker[tid].times[TIME_MUTEX_LOCK] += elapsed;
 	  stat_inc(tid, STAT_MUTEX_LOCKS);
 	}
@@ -687,12 +693,25 @@ static inline void do_pthread_mutex_lock(pthread_mutex_t *mymutex, int tid __may
 static inline void do_pthread_mutex_unlock(pthread_mutex_t *mymutex, int tid __maybe_unused)
 {
   if (unlikely(timestat)) {
-	u32 aux;
-	u64 elapsed;
-	u64 tsstart = __rdtscp(&aux);
-	pthread_mutex_unlock(mymutex);
-	elapsed = (__rdtscp(&aux) - tsstart);
-	if (elapsed > fastpathLimitTicks) {
+	futex_t *pmyfutex = (futex_t *) &mymutex->__data.__lock;
+	futex_t val = 1;
+	// always clear some fields
+	mymutex->__data.__owner = 0;
+	mymutex->__data.__nusers--;
+	// then try for fastpath unlock and don't time things if it succeeds
+	// fastpath unlock is if futex goes from 1 to 0
+	// we'll use cmpxchg here and in case it fails, futex will be unchanged.
+	// so we won't have to do anything to it in the slowpath
+	if (atomic_cmpxchg_acquire(pmyfutex, &val, 0)) {
+	  return;
+	} else {
+	  // slowpath
+	  u32 aux;
+	  u64 elapsed;
+	  u64 tsstart;
+	  tsstart = __rdtscp(&aux);
+	  pthread_mutex_unlock(mymutex);
+	  elapsed = (__rdtscp(&aux) - tsstart);
 	  worker[tid].times[TIME_MUTEX_UNLK] += elapsed;
 	  stat_inc(tid, STAT_MUTEX_UNLOCKS);
 	}
@@ -1215,10 +1234,10 @@ print_stat:
 			printf("Avg exclusive unlock syscall = %'ldns\n",
 			    total.times[TIME_UNLK]/total.stats[STAT_UNLOCKS]);
 		if (total.stats[STAT_MUTEX_LOCKS])
-		  printf("Avg pthread_mutex_lock > %ld ns  = %'ld ns\n", fastpathLimitNs,
+		  printf("Avg pthread_mutex_lock slowpath time = %'ld ns\n",
 				 (1000 * total.times[TIME_MUTEX_LOCK]/total.stats[STAT_MUTEX_LOCKS])/tscTicksPerUs);
 		if (total.stats[STAT_MUTEX_UNLOCKS])
-		  printf("Avg pthread_mutex_lock > %ld ns  = %'ld ns\n", fastpathLimitNs,
+		  printf("Avg pthread_mutex_lock slowpath time = %'ld ns\n",
 				   (1000 * total.times[TIME_MUTEX_UNLK]/total.stats[STAT_MUTEX_LOCKS])/tscTicksPerUs);
 		if (total.stats[STAT_GETTID])
 			printf("Avg gettid syscall = %'ldns\n",
@@ -1239,10 +1258,10 @@ print_stat:
 		printf("Process wakeups              = %.1f%%\n",
 			stat_percent(&total, STAT_WAKEUPS, STAT_UNLOCKS));
 	if (total.stats[STAT_MUTEX_LOCKS])
-		printf("Pthread_mutex_lock slowpaths     = %.1f%%\n",
+		printf("pthread_mutex_lock slowpaths     = %.1f%%\n",
 			stat_percent(&total, STAT_MUTEX_LOCKS, STAT_OPS));
 	if (total.stats[STAT_MUTEX_UNLOCKS])
-		printf("Exclusive unlock slowpaths   = %.1f%%\n",
+		printf("pthread_mutex_unlock slowpaths   = %.1f%%\n",
 			stat_percent(&total, STAT_MUTEX_UNLOCKS, STAT_OPS));
 
 	printf("\nPer-thread Locking Rates:\n");
@@ -1288,9 +1307,6 @@ int bench_futex_mutex(int argc, const char **argv,
 	// compute tscTicksPerUs
 	compute_tscTicksPerUs();
 
-	// get fastpathLimit in ticks
-	fastpathLimitTicks = (fastpathLimitNs * tscTicksPerUs) / 1000;
-	
 	// hack to support NOU "lock" type which needs a timeout
 	// otherwise it hangs
 	if (!strcmp(ftype, "NOU") && timeout == 0) {
