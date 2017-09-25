@@ -344,22 +344,13 @@ do {				\
 
 /**********************[ MUTEX lock/unlock functions ]*********************/
 
-/*
- * Wait-wake futex lock/unlock functions (Glibc implementation)
- * futex value: 0 - unlocked
- *		1 - locked
- *		2 - locked with waiters (contended)
- */
-static void ww_mutex_lock(futex_t *futex, int tid)
+static inline void ww_mutex_lock_slowpath(futex_t *futex, futex_t val, int tid __maybe_unused)
 {
-	futex_t val = 0;
-	int ret;
+	// slowpath
+    int ret;
 	int futwaits = 0;
 	
-	if (atomic_cmpxchg_acquire(futex, &val, 1))
-		return;
-
-	stat_inc(tid, STAT_LOCKS);
+    stat_inc(tid, STAT_LOCKS);
 	for (;;) {
 		if (val != 2) {
 			/*
@@ -370,11 +361,11 @@ static void ww_mutex_lock(futex_t *futex, int tid)
 			  if (futwaits == 0) {
 			    stat_inc(tid, STAT_LOCKS_SUCC2);
 			  }
-			  stat_add(tid, STAT_FUTEX_WAIT_CALLS, futwaits);
 			  return;
 			}
 		}
 		futwaits++;
+		stat_add(tid, STAT_FUTEX_WAIT_CALLS, futwaits);
 		FUTEX_CALL(futex_wait, TIME_LOCK, futex, 2, ptospec, flags);
 
 		if (ret < 0) {
@@ -388,6 +379,23 @@ static void ww_mutex_lock(futex_t *futex, int tid)
 
 		val = *futex;
 	}
+}
+
+
+/*
+ * Wait-wake futex lock/unlock functions (Glibc implementation)
+ * futex value: 0 - unlocked
+ *		1 - locked
+ *		2 - locked with waiters (contended)
+ */
+static void ww_mutex_lock(futex_t *futex, int tid)
+{
+	futex_t val = 0;
+	
+	if (atomic_cmpxchg_acquire(futex, &val, 1))
+		return;
+
+	ww_mutex_lock_slowpath(futex, val, tid);
 }
 
 static void ww_mutex_unlock(futex_t *futex, int tid)
@@ -431,7 +439,6 @@ static void ww2_mutex_lock(futex_t *futex, int tid)
 				    if (futwaits == 0) {
 					  stat_inc(tid, STAT_LOCKS_SUCC2);
 					}
-					stat_add(tid, STAT_FUTEX_WAIT_CALLS, futwaits);
 					return;
 				}
 				continue;
@@ -443,6 +450,7 @@ static void ww2_mutex_lock(futex_t *futex, int tid)
 		}
 
 		futwaits++;
+		stat_add(tid, STAT_FUTEX_WAIT_CALLS, futwaits);
 		FUTEX_CALL(futex_wait, TIME_LOCK, futex, val, ptospec, flags);
 		if (ret < 0) {
 			if (errno == EAGAIN)
@@ -474,49 +482,6 @@ static void ww2_mutex_unlock(futex_t *futex, int tid)
 			stat_inc(tid, STAT_UNLKERRS);
 		else
 			stat_add(tid, STAT_WAKEUPS, ret);
-	}
-}
-
-
-/*
- * Version of ww_mutex_lock where we read the futex first
- * and so might avoid the first cmpxchg
- */
-
-static void ww3_mutex_lock(futex_t *futex, int tid)
-{
-	futex_t val = 0;
-	int ret;
-
-	if (*futex != 0) {
-	  goto slowpath;
-	}
-	if (atomic_cmpxchg_acquire(futex, &val, 1))
-		return;
-
-slowpath:
-	stat_inc(tid, STAT_LOCKS);
-	for (;;) {
-		if (val != 2) {
-			/*
-			 * Force value to 2 to indicate waiter
-			 */
-			val = atomic_xchg_acquire(futex, 2);
-			if (val == 0)
-				return;
-		}
-		FUTEX_CALL(futex_wait, TIME_LOCK, futex, 2, ptospec, flags);
-
-		if (ret < 0) {
-			if (errno == EAGAIN)
-				stat_inc(tid, STAT_EAGAINS);
-			else if (errno == ETIMEDOUT)
-				stat_inc(tid, STAT_TIMEOUTS);
-			else
-				stat_inc(tid, STAT_LOCKERRS);
-		}
-
-		val = *futex;
 	}
 }
 
@@ -686,7 +651,6 @@ static inline void do_pthread_mutex_lock(pthread_mutex_t *mymutex, int tid __may
 	  stat_inc(tid, STAT_MUTEX_LOCKS);
 	}
   } else {
-	pthread_mutex_lock(mymutex);
   }
 }
 
@@ -694,21 +658,28 @@ static inline void do_pthread_mutex_unlock(pthread_mutex_t *mymutex, int tid __m
 {
   if (unlikely(timestat)) {
 	futex_t *pmyfutex = (futex_t *) &mymutex->__data.__lock;
-	futex_t val = 1;
+	futex_t val;
 	// always clear some fields
 	mymutex->__data.__owner = 0;
 	mymutex->__data.__nusers--;
 	// then try for fastpath unlock and don't time things if it succeeds
 	// fastpath unlock is if futex goes from 1 to 0
-	// we'll use cmpxchg here and in case it fails, futex will be unchanged.
+	// first we tried using cmpxchg from 1 to 0 here
 	// so we won't have to do anything to it in the slowpath
-	if (atomic_cmpxchg_acquire(pmyfutex, &val, 0)) {
+	// it worked, but seemed to have a strong neg perf effect on BDW
+	// so we'll do a lock sub just like the original but if it fail
+	// we will then have to do a lock inc
+	val = atomic_dec_return(pmyfutex);
+	if (val == 0) {
 	  return;
 	} else {
 	  // slowpath
 	  u32 aux;
 	  u64 elapsed;
 	  u64 tsstart;
+	  // need to restore futex back to what it was before the dec
+	  *pmyfutex = val + 1;
+	  // atomic_inc_return(pmyfutex);
 	  tsstart = __rdtscp(&aux);
 	  pthread_mutex_unlock(mymutex);
 	  elapsed = (__rdtscp(&aux) - tsstart);
@@ -727,14 +698,109 @@ static void gc_mutex_lock(futex_t *futex __maybe_unused,
 			  int tid __maybe_unused)
 {
     struct worker *w = &worker[tid];
-	do_pthread_mutex_lock(w->pmutex, tid);
+	pthread_mutex_lock(w->pmutex);
 }
 
 static void gc_mutex_unlock(futex_t *futex __maybe_unused,
 			    int tid __maybe_unused)
 {
     struct worker *w = &worker[tid];
-	do_pthread_mutex_unlock(w->pmutex, tid);
+	pthread_mutex_unlock(w->pmutex);
+}
+
+enum {
+  PTHREAD_MUTEX_ELISION_NP    = 256,
+  PTHREAD_MUTEX_NO_ELISION_NP = 512,
+  PTHREAD_MUTEX_KIND_MASK_NP = 3,
+  PTHREAD_MUTEX_ELISION_FLAGS_NP
+  = PTHREAD_MUTEX_ELISION_NP | PTHREAD_MUTEX_NO_ELISION_NP,
+};
+
+#define PTHREAD_MUTEX_TYPE_ELISION(m)					\
+  ((m)->__data.__kind & (127|PTHREAD_MUTEX_ELISION_NP))
+
+
+static void handle_unknown_mutex_type(int type, pthread_mutex_t *pmutex) {
+  printf("unexpected mutex type %x in mutex %p\n", type, pmutex);
+  exit(1);
+}
+
+
+/*
+ * Modififed "Glibc-equivalent" mutex lock and unlock function
+ * to allow us to time the slowpaths
+ */
+static void gc2_mutex_lock(futex_t *futex __maybe_unused,
+			  int tid __maybe_unused)
+{
+    struct worker *w = &worker[tid];
+	futex_t *pmyfutex = (futex_t *) &w->pmutex->__data.__lock;
+	futex_t val = 0;
+
+	// this initial checking of mutex type should never take
+	// the exit path but we have it here to more closely
+	// match what the libpthread routines were doing
+	// since it might have some effect on throughput
+	int type = PTHREAD_MUTEX_TYPE_ELISION (w->pmutex);
+	if (__builtin_expect (type &
+						  ~(PTHREAD_MUTEX_KIND_MASK_NP|PTHREAD_MUTEX_ELISION_FLAGS_NP), 0)) {
+	
+	  handle_unknown_mutex_type(type, w->pmutex);
+	}
+
+	if (__builtin_expect (type, PTHREAD_MUTEX_TIMED_NP)
+		!= PTHREAD_MUTEX_TIMED_NP) {
+	  handle_unknown_mutex_type(type, w->pmutex);
+	}
+	// We try a cmpxchg first and return quick without
+	// timing things if it succeeds
+
+	if (atomic_cmpxchg_acquire(pmyfutex, &val, 1)) {
+	  // fastpath wil just set owner, nusers
+	} else {
+	  ww_mutex_lock_slowpath(pmyfutex, val, tid);
+	}
+	w->pmutex->__data.__owner = (int) thread_id;
+	w->pmutex->__data.__nusers++;
+}
+
+static void gc2_mutex_unlock(futex_t *futex __maybe_unused,
+			    int tid __maybe_unused)
+{
+	futex_t val;
+	int ret;
+    struct worker *w = &worker[tid];
+	futex_t *pmyfutex = (futex_t *) &w->pmutex->__data.__lock;
+
+	// see note above under gc2_mutex_lock
+	int type = PTHREAD_MUTEX_TYPE_ELISION (w->pmutex);
+	if (__builtin_expect (type &
+						  ~(PTHREAD_MUTEX_KIND_MASK_NP|PTHREAD_MUTEX_ELISION_FLAGS_NP), 0)) {
+	
+	  handle_unknown_mutex_type(type, w->pmutex);
+	}
+
+	if (__builtin_expect (type, PTHREAD_MUTEX_TIMED_NP)
+		!= PTHREAD_MUTEX_TIMED_NP) {
+	  handle_unknown_mutex_type(type, w->pmutex);
+	}
+	
+	// we can access the additional data fields while we hold the lock
+	w->pmutex->__data.__owner = 0;
+	w->pmutex->__data.__nusers--;
+	
+	val = atomic_dec_return(pmyfutex);
+
+	if (val == 1) {
+		stat_inc(tid, STAT_UNLOCKS);
+		*pmyfutex = 0;     // need to zero this out because it is still 1
+		FUTEX_CALL(futex_wake, TIME_UNLK, pmyfutex, 1, flags);
+
+		if (ret < 0)
+			stat_inc(tid, STAT_UNLKERRS);
+		else
+			stat_add(tid, STAT_WAKEUPS, ret);
+	}
 }
 
 
@@ -1010,6 +1076,22 @@ static void create_threads(struct worker *w, pthread_attr_t *thread_attr,
 		err(EXIT_FAILURE, "pthread_create");
 }
 
+static void mutex_setup_common(void) {
+  pthread_mutexattr_t *attr = NULL;
+  
+  /*
+   * Initialize pthread mutex
+   */
+  if (fshared) {
+	attr = &mutex_attr;
+	pthread_mutexattr_init(attr);
+	mutex_attr_inited = true;
+	pthread_mutexattr_setpshared(attr, true);
+  }
+  pthread_mutex_init(&mutex, attr);
+  mutex_inited = true;
+}
+
 static int futex_mutex_type(const char **ptype)
 {
 	const char *type = *ptype;
@@ -1022,10 +1104,6 @@ static int futex_mutex_type(const char **ptype)
 		*ptype = "WW2";
 		mutex_lock_fn = ww2_mutex_lock;
 		mutex_unlock_fn = ww2_mutex_unlock;
-	} else if (!strcasecmp(type, "WW3")) {
-		*ptype = "WW3";
-		mutex_lock_fn = ww3_mutex_lock;
-		mutex_unlock_fn = ww_mutex_unlock;
 	} else if (!strcasecmp(type, "NOU")) {
 		*ptype = "NOU";
 		mutex_lock_fn = nousermode_mutex_lock;
@@ -1039,23 +1117,15 @@ static int futex_mutex_type(const char **ptype)
 		mutex_lock_fn = pi_mutex_lock;
 		mutex_unlock_fn = pi_mutex_unlock;
 	} else if (!strcasecmp(type, "GC")) {
-		pthread_mutexattr_t *attr = NULL;
-
 		*ptype = "GC";
 		mutex_lock_fn = gc_mutex_lock;
 		mutex_unlock_fn = gc_mutex_unlock;
-		
-		/*
-		 * Initialize pthread mutex
-		 */
-		if (fshared) {
-			attr = &mutex_attr;
-			pthread_mutexattr_init(attr);
-			mutex_attr_inited = true;
-			pthread_mutexattr_setpshared(attr, true);
-		}
-		pthread_mutex_init(&mutex, attr);
-		mutex_inited = true;
+		mutex_setup_common();
+	} else if (!strcasecmp(type, "GC2")) {
+		*ptype = "GC";
+		mutex_lock_fn = gc2_mutex_lock;
+		mutex_unlock_fn = gc2_mutex_unlock;
+		mutex_setup_common();
 	} else if (!strcasecmp(type, "QS")) {
 		*ptype = "QS";
 		mutex_lock_fn = lock_mcs;
@@ -1239,7 +1309,7 @@ print_stat:
 		if (total.stats[STAT_MUTEX_UNLOCKS])
 		  printf("Avg pthread_mutex_lock slowpath time = %'ld ns\n",
 				   (1000 * total.times[TIME_MUTEX_UNLK]/total.stats[STAT_MUTEX_LOCKS])/tscTicksPerUs);
-		if (total.stats[STAT_GETTID])
+		if (false && total.stats[STAT_GETTID])
 			printf("Avg gettid syscall = %'ldns\n",
 			    total.times[TIME_GETTID]/total.stats[STAT_GETTID]);
 	}
@@ -1254,6 +1324,9 @@ print_stat:
 	if (total.stats[STAT_EAGAINS])
 		printf("EAGAIN lock errors           = %.1f%%\n",
 			stat_percent(&total, STAT_EAGAINS, STAT_LOCKS));
+	if (total.stats[STAT_FUTEX_WAIT_CALLS])
+		printf("Futex waits per slow lock    = %.1f\n",
+			   (double)total.stats[STAT_FUTEX_WAIT_CALLS]/total.stats[STAT_LOCKS]);
 	if (total.stats[STAT_WAKEUPS])
 		printf("Process wakeups              = %.1f%%\n",
 			stat_percent(&total, STAT_WAKEUPS, STAT_UNLOCKS));
