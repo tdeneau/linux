@@ -1085,7 +1085,7 @@ static int futex_mutex_type(const char **ptype)
 		mutex_unlock_fn = gc_mutex_unlock;
 		mutex_setup_common();
 	} else if (!strcasecmp(type, "GC2")) {
-		*ptype = "GC";
+		*ptype = "GC2";
 		mutex_lock_fn = gc2_mutex_lock;
 		mutex_unlock_fn = gc2_mutex_unlock;
 		mutex_setup_common();
@@ -1260,8 +1260,10 @@ print_stat:
 
 	if (timestat && (total.times[TIME_LOCK])) {
 		printf("\nSyscall times:\n");
-		if (total.stats[STAT_LOCKS])
-		  stat_syscall_time(&total, "Avg exclusive lock syscall", TIME_LOCK, STAT_LOCKS);
+		// note: want to divide by futex_wait_calls count since there can be several per slowpath
+		if (total.stats[STAT_FUTEX_WAIT_CALLS])
+		  stat_syscall_time(&total, "Avg exclusive lock syscall", TIME_LOCK, STAT_FUTEX_WAIT_CALLS);
+		// for unlocks, we always have exactly one syscall per slowpath so okay to use STAT_UNLOCKS here
 		if (total.stats[STAT_UNLOCKS])
 		  stat_syscall_time(&total, "Avg exclusive unlock syscall", TIME_UNLK, STAT_UNLOCKS);
 		//if (total.stats[STAT_GETTID])
