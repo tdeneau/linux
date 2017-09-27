@@ -89,7 +89,7 @@ struct worker {
 	/*
 	 * Per-thread operation statistics
 	 */
-	u32 stats[STAT_NUM];
+	u64 stats[STAT_NUM];
 
 	/*
 	 * Lock/unlock times
@@ -162,10 +162,11 @@ static bool mutex_inited, mutex_attr_inited;
 static void compute_systime(int tid, int item, struct timespec *begin)
 {
 	struct timespec etime;
-
+	u64 elapsed;
+	
 	clock_gettime(CLOCK_REALTIME, &etime);
-	worker[tid].times[item] += (etime.tv_sec  - begin->tv_sec)*1000000000 +
-				    etime.tv_nsec - begin->tv_nsec;
+	elapsed = (etime.tv_sec  - begin->tv_sec)*1000000000 +  etime.tv_nsec - begin->tv_nsec;
+	worker[tid].times[item] += elapsed;
 }
 
 static inline double stat_percent(struct worker *w, int top, int bottom)
@@ -386,11 +387,11 @@ static inline void ww_mutex_lock_slowpath(futex_t *futex, futex_t val, int tid _
 			  if (futwaits == 0) {
 			    stat_inc(tid, STAT_LOCKS_SUCC2);
 			  }
+			  stat_add(tid, STAT_FUTEX_WAIT_CALLS, futwaits);
 			  return;
 			}
 		}
 		futwaits++;
-		stat_add(tid, STAT_FUTEX_WAIT_CALLS, futwaits);
 		FUTEX_CALL(futex_wait, TIME_LOCK, futex, 2, ptospec, flags);
 
 		if (ret < 0) {
@@ -464,6 +465,7 @@ static void ww2_mutex_lock(futex_t *futex, int tid)
 				    if (futwaits == 0) {
 					  stat_inc(tid, STAT_LOCKS_SUCC2);
 					}
+					stat_add(tid, STAT_FUTEX_WAIT_CALLS, futwaits);
 					return;
 				}
 				continue;
@@ -475,7 +477,6 @@ static void ww2_mutex_lock(futex_t *futex, int tid)
 		}
 
 		futwaits++;
-		stat_add(tid, STAT_FUTEX_WAIT_CALLS, futwaits);
 		FUTEX_CALL(futex_wait, TIME_LOCK, futex, val, ptospec, flags);
 		if (ret < 0) {
 			if (errno == EAGAIN)
@@ -1256,7 +1257,7 @@ print_stat:
 	printf("%-28s = %'.2fs\n", "Test run time", (double)us/1000000);
 	for (i = 0; i < STAT_NUM; i++)
 		if (total.stats[i])
-			printf("%-28s = %'12d\n", desc[i], total.stats[i]);
+			printf("%-28s = %'12ld\n", desc[i], total.stats[i]);
 
 	if (timestat && (total.times[TIME_LOCK])) {
 		printf("\nSyscall times:\n");
