@@ -275,7 +275,7 @@ static inline void stat_inc(int tid __maybe_unused, int item __maybe_unused)
  */
 static const struct option mutex_options[] = {
     OPT_STRING  ('d', "locklat",	&locklatStr, "int", "Specify inter-locking latency, supports random within range (default = 1)"),
-	OPT_STRING  ('f', "ftype",	&ftype,    "type", "Specify futex type: WW, PI, GC, all (default)"),
+	OPT_STRING  ('f', "ftype",	&ftype,    "type", "Specify futex type: WW, PI, GC, GC2, WW2, NOU, NOK, QS, NONE, all (default)"),
 	OPT_INTEGER ('l', "loadlat",	&loadlat,  "Specify load latency (default = 1)"),
 	OPT_UINTEGER('r', "runtime",	&nsecs,    "Specify runtime (in seconds, default = 10s)"),
 	OPT_BOOLEAN ('S', "shared",	&fshared,  "Use shared futexes instead of private ones"),
@@ -287,7 +287,7 @@ static const struct option mutex_options[] = {
 	OPT_INTEGER ('b', "bufstep",    &bufstep,  "Step size in bytes thru buffer during delays, default = 64"),
 	OPT_INTEGER ('x', "cmpxchg-limit",    &cmpxchg_limit,  "limit to number of cmpxchgs in nokernel_lock"),
 	OPT_INTEGER ('B', "worker-buf-size", &workerBufSizeInKB, "size in KB of worker buffer used in csdelay"),
-	OPT_INTEGER ('D', "delay-policy", &delayPolicy, "type of delay loop to use in csdelay"),
+	OPT_INTEGER ('D', "delay-policy", &delayPolicy, "type of delay loop to use in csdelay\n 1=stores, 2=nops, 3=clock-based"),
 	OPT_INTEGER ('A', "affinity-policy",  &affinityPolicy,  "0 = do not call pthread_set_affinity, 1 = pthread_set_affinity each thr to 1 cpu in affinity set"),
 	OPT_INTEGER ('C', "lock-count-stop",  &lockCountStop,  "if set, stop after this many lock ops each thread"),
 	OPT_BOOLEAN ('U', "uncontended-mutex",	&uncontendedMutex,  "if set each thread gets its own mutex, so no contention"),
@@ -856,6 +856,12 @@ static inline void unlock_mcs(futex_t *futex __maybe_unused, int tid)
 #define gen10(n)  n;n;n;n;n;n;n;n;n;n;
 #define gen5(n)   n;n;n;n;n;
 
+static inline u64 nsnow(void){
+  struct timespec stime;
+  clock_gettime(CLOCK_REALTIME, &stime);
+  return((stime.tv_sec*1000000000L+stime.tv_nsec));
+}
+
 static inline void csdelay(int n, int tid)
 {
   struct worker *w = &worker[tid];
@@ -892,6 +898,13 @@ static inline void csdelay(int n, int tid)
 	  gen10(asm("nop"));
 	  gen5(asm("nop"));
 	}
+  }
+  else if (delayPolicy == 3) {
+	u64 now;
+	u64 dstart = nsnow();
+	do {
+	  now = nsnow();
+	} while (now - dstart < (unsigned)n);
   }
   
 }
@@ -1303,7 +1316,7 @@ print_stat:
 	printf("\nPercentages:\n");
 	show_stat_percent(&total, STAT_LOCKS, STAT_OPS, "Exclusive lock slowpaths");
 	show_stat_percent(&total, STAT_UNLOCKS, STAT_OPS, "Exclusive unlock slowpaths");
-	show_stat_percent(&total, STAT_EAGAINS, STAT_LOCKS, "EAGAIN lock errors");
+	show_stat_percent(&total, STAT_EAGAINS, STAT_FUTEX_WAIT_CALLS, "EAGAIN lock errors");
 	if (total.stats[STAT_FUTEX_WAIT_CALLS])
 	  printf("%-30s = %.1f\n", "Futex waits per slow lock",
 			 (double)total.stats[STAT_FUTEX_WAIT_CALLS]/total.stats[STAT_LOCKS]);
