@@ -66,8 +66,6 @@ enum {
 	STAT_MCS_UNLOCKS,	/* # for mcs only */
 	STAT_FUTEX_WAIT_CALLS, 
 	STAT_LOCKS_SUCC2, /* # of locks that took slowpath but did not call futex wait */
-	STAT_MUTEX_LOCKS, /* calls to pthread_mutex_lock */
-	STAT_MUTEX_UNLOCKS, /* calls to pthread_mutex_unlock */
 	STAT_GETTID,      /* for minimum syscall timing */
 	STAT_NUM	      /* Total # of statistical count		*/
 };
@@ -79,6 +77,7 @@ enum {
 	TIME_LOCK,	/* Total exclusive lock syscall time	*/
 	TIME_UNLK,	/* Total exclusive unlock syscall time	*/
 	TIME_GETTID, /* for minimum syscall timing */
+	TIME_LOCKLAT_DELAY, /* checks for slowdowns in cpu clk? */
 	TIME_NUM,
 };
 
@@ -148,6 +147,7 @@ static bool uncontendedMutex;
 static bool gettidOpMarker; 
 static u64 tscTicksPerUs;
 static bool usetsc;
+static bool timeLockLatDelay;
 
 /*
  * Glibc mutex
@@ -174,6 +174,17 @@ static inline double stat_percent(struct worker *w, int top, int bottom)
 	return (double)w->stats[top] * 100 / w->stats[bottom];
 }
 
+static void show_stat_percent(struct worker *w, int top, int bottom, const char *desc)
+{
+  if (w->stats[top]) {
+	const char *fmt;
+	double pct = stat_percent(w, top, bottom);
+	printf("%-30s = ", desc);
+	fmt = (pct < 0.1 ? "%.5f" : "%.1f");
+	printf(fmt, pct);
+	printf("%%\n");
+  }
+}
 static void stat_syscall_time(struct worker *w, const char *label, int timeitem, int countitem) {
   u64 avg;
   double nstime = w->times[timeitem];
@@ -282,6 +293,7 @@ static const struct option mutex_options[] = {
 	OPT_BOOLEAN ('U', "uncontended-mutex",	&uncontendedMutex,  "if set each thread gets its own mutex, so no contention"),
 	OPT_BOOLEAN ('G', "gettid-marks-lock",	&gettidOpMarker,  "if set, call gettid so lttng has some opmarker"),
 	OPT_BOOLEAN ('R', "use-rdtscp",  	&usetsc,  "if set, use rdtsc instead of clock_gettime for timestat"),
+	OPT_BOOLEAN ('L', "time-locklat-delay", &timeLockLatDelay,  "if set, show avg times for locklat delay loop"),
 	OPT_END()
 };
 
@@ -965,7 +977,25 @@ static void *mutex_workerfn(void *arg)
 		  int randval = rand_r(&w->randseed);
 		  locklat = locklatLo + (randval % (locklatHi - locklatLo));
 		}
-		csdelay(locklat, tid);
+		if (!timeLockLatDelay) {
+		  csdelay(locklat, tid);
+		}
+		else {
+		  if (!usetsc) {
+			struct timespec stime;
+			clock_gettime(CLOCK_REALTIME, &stime);  
+			csdelay(locklat, tid);
+			compute_systime(tid, TIME_LOCKLAT_DELAY, &stime);
+		  }
+		  else {
+			u32 aux;
+			u64 tsstart, elapsed;
+			tsstart = __rdtscp(&aux);
+			csdelay(locklat, tid);
+			elapsed = __rdtscp(&aux) - tsstart;
+			worker[tid].times[TIME_LOCKLAT_DELAY] += elapsed;
+		  }
+		}
 	}  while (!done);
 	
 	if (verbose)
@@ -1135,9 +1165,6 @@ static void futex_test_driver(const char *futex_type,
 		[STAT_MCS_UNLOCKS]  = "\nMCS unlock slowpaths",
 		[STAT_FUTEX_WAIT_CALLS]  = "Futex Wait Calls",
 		[STAT_LOCKS_SUCC2]  = "Slowpaths w/no futex waits",
-		// these two useful for glibc ftype
-		[STAT_MUTEX_LOCKS]  = "pthread_mutex_locks slowpath",
-		[STAT_MUTEX_UNLOCKS]  = "pthread_mutex_unlocks slowpath",
 		[STAT_GETTID] = "gettid",
 	};
 
@@ -1259,7 +1286,7 @@ print_stat:
 		if (total.stats[i])
 			printf("%-28s = %'12ld\n", desc[i], total.stats[i]);
 
-	if (timestat && (total.times[TIME_LOCK])) {
+	if (timestat) {
 		printf("\nSyscall times:\n");
 		// note: want to divide by futex_wait_calls count since there can be several per slowpath
 		if (total.stats[STAT_FUTEX_WAIT_CALLS])
@@ -1269,30 +1296,18 @@ print_stat:
 		  stat_syscall_time(&total, "Avg exclusive unlock syscall", TIME_UNLK, STAT_UNLOCKS);
 		//if (total.stats[STAT_GETTID])
 		//  stat_syscall_time(&total, "Avg gettid syscall", TIME_GETTID, STAT_GETTID);
+		if (total.times[TIME_LOCKLAT_DELAY])
+		  stat_syscall_time(&total, "Avg locklat delay", TIME_LOCKLAT_DELAY, STAT_OPS);
 	}
 
 	printf("\nPercentages:\n");
-	if (total.stats[STAT_LOCKS])
-		printf("Exclusive lock slowpaths     = %.1f%%\n",
-			stat_percent(&total, STAT_LOCKS, STAT_OPS));
-	if (total.stats[STAT_UNLOCKS])
-		printf("Exclusive unlock slowpaths   = %.1f%%\n",
-			stat_percent(&total, STAT_UNLOCKS, STAT_OPS));
-	if (total.stats[STAT_EAGAINS])
-		printf("EAGAIN lock errors           = %.1f%%\n",
-			stat_percent(&total, STAT_EAGAINS, STAT_LOCKS));
+	show_stat_percent(&total, STAT_LOCKS, STAT_OPS, "Exclusive lock slowpaths");
+	show_stat_percent(&total, STAT_UNLOCKS, STAT_OPS, "Exclusive unlock slowpaths");
+	show_stat_percent(&total, STAT_EAGAINS, STAT_LOCKS, "EAGAIN lock errors");
 	if (total.stats[STAT_FUTEX_WAIT_CALLS])
-		printf("Futex waits per slow lock    = %.1f\n",
-			   (double)total.stats[STAT_FUTEX_WAIT_CALLS]/total.stats[STAT_LOCKS]);
-	if (total.stats[STAT_WAKEUPS])
-		printf("Process wakeups              = %.1f%%\n",
-			stat_percent(&total, STAT_WAKEUPS, STAT_UNLOCKS));
-	if (total.stats[STAT_MUTEX_LOCKS])
-		printf("pthread_mutex_lock slowpaths     = %.1f%%\n",
-			stat_percent(&total, STAT_MUTEX_LOCKS, STAT_OPS));
-	if (total.stats[STAT_MUTEX_UNLOCKS])
-		printf("pthread_mutex_unlock slowpaths   = %.1f%%\n",
-			stat_percent(&total, STAT_MUTEX_UNLOCKS, STAT_OPS));
+	  printf("%-30s = %.1f\n", "Futex waits per slow lock",
+			 (double)total.stats[STAT_FUTEX_WAIT_CALLS]/total.stats[STAT_LOCKS]);
+	show_stat_percent(&total, STAT_WAKEUPS, STAT_UNLOCKS, "Process Wakeups");
 
 	printf("\nPer-thread Locking Rates:\n");
 	printf("Avg = %'d ops/sec (+- %.2f%%)\n", (int)(avg + 0.5),
