@@ -900,11 +900,29 @@ static inline void csdelay(int n, int tid)
 	}
   }
   else if (delayPolicy == 3) {
+#if 1
 	u64 now;
 	u64 dstart = nsnow();
 	do {
 	  now = nsnow();
 	} while (now - dstart < (unsigned)n);
+#else
+	// see if any big amounts in last increment
+	u64 now, prev;
+	u64 dstart = nsnow();
+	now = dstart;
+	do {
+	  prev = now;
+	  now = nsnow();
+	} while (now - dstart < (unsigned)n);
+	if ((tid==1) && (now-prev > 200)) {
+	  printf("%ld\n", now - prev);
+	}
+#endif
+  }
+  else {
+	printf("Unknown delay policy %d\n", delayPolicy);
+	exit(1);
   }
   
 }
