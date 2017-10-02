@@ -39,12 +39,15 @@ static unsigned int threads_starting;
 static struct stats throughput_stats;
 static pthread_cond_t thread_parent, thread_worker;
 static int affinityPolicy = 0;
+static bool commonFutexes;
+static int lockCountStop;
 
 struct worker {
 	int tid;
 	u_int32_t *futex;
 	pthread_t thread;
 	unsigned long ops;
+	u_int32_t **pfutex;
 };
 
 static const struct option options[] = {
@@ -54,6 +57,8 @@ static const struct option options[] = {
 	OPT_BOOLEAN( 's', "silent",  &silent,   "Silent mode: do not display data/details"),
 	OPT_BOOLEAN( 'S', "shared",  &fshared,  "Use shared futexes instead of private ones"),
 	OPT_INTEGER ('A', "affinity-policy",  &affinityPolicy,  "0 = do not call pthread_set_affinity, 1 = affinitize to sequential cpus"),
+	OPT_BOOLEAN( 'c', "common-futexes",  &commonFutexes,  "Use futexes that are common to all threads (stresses spinlock)"),
+	OPT_INTEGER ('C', "lock-count-stop",  &lockCountStop,  "if set, stop after this many lock ops each thread"),
 	OPT_END()
 };
 
@@ -84,13 +89,17 @@ static void *workerfn(void *arg)
 			 * such as internal waitqueue handling, thus enlarging
 			 * the critical region protected by hb->lock.
 			 */
-			ret = futex_wait(&w->futex[i], 1234, NULL, futex_flag);
+			ret = futex_wait(w->pfutex[i], 1234, NULL, futex_flag);
 			if (!silent &&
 			    (!ret || errno != EAGAIN || errno != EWOULDBLOCK))
 				warn("Non-expected futex return call");
+			if ((lockCountStop > 0) && (ops >= (u32) lockCountStop)) {
+			  goto loopDone;
+			}
 		}
 	}  while (!done);
 
+loopDone:
 	w->ops = ops;
 	return NULL;
 }
@@ -110,9 +119,9 @@ static void print_summary(void)
 	unsigned long avg = avg_stats(&throughput_stats);
 	double stddev = stddev_stats(&throughput_stats);
 
-	printf("%sAveraged %ld operations/sec (+- %.2f%%), total secs = %d\n",
+	printf("%sAveraged %ld operations/sec (+- %.2f%%), total secs = %.2f\n",
 	       !silent ? "\n" : "", avg, rel_stddev_stats(stddev, avg),
-	       (int) runtime.tv_sec);
+	       (double) runtime.tv_sec + runtime.tv_usec/1000000.0 );
 }
 
 int bench_futex_hash(int argc, const char **argv,
@@ -121,7 +130,7 @@ int bench_futex_hash(int argc, const char **argv,
 	int ret = 0;
 	cpu_set_t cpu;
 	struct sigaction act;
-	unsigned int i, ncpus;
+	unsigned int i, j, ncpus;
 	pthread_attr_t thread_attr;
 	struct worker *worker = NULL;
 
@@ -147,9 +156,16 @@ int bench_futex_hash(int argc, const char **argv,
 	if (!fshared)
 		futex_flag = FUTEX_PRIVATE_FLAG;
 
-	printf("Run summary [PID %d]: %d threads, each operating on %d [%s] futexes for %d secs.\n\n",
-	       getpid(), nthreads, nfutexes, fshared ? "shared":"private", nsecs);
-
+	printf("Run summary [PID %d]: %d threads, each operating on %d [%s] futexes ",
+	       getpid(), nthreads, nfutexes, fshared ? "shared":"private");
+	if (lockCountStop) {
+	  printf("until %d ops/thr \n", lockCountStop);
+	}
+	else {
+	  printf("for %d secs.\n", nsecs);
+	}
+	printf("%s\n\n", commonFutexes ? "all threads contend on the same futexes" : "each thread has its own futexes");
+	
 	init_stats(&throughput_stats);
 	pthread_mutex_init(&thread_lock, NULL);
 	pthread_cond_init(&thread_parent, NULL);
@@ -163,7 +179,10 @@ int bench_futex_hash(int argc, const char **argv,
 		worker[i].futex = calloc(nfutexes, sizeof(*worker[i].futex));
 		if (!worker[i].futex)
 			goto errmem;
-
+		worker[i].pfutex = calloc(nfutexes, sizeof(u_int32_t *));
+		for (j=0; j < nfutexes; j++) {
+		  worker[i].pfutex[j] = (commonFutexes ? &worker[0].futex[j] : &worker[i].futex[j]);
+		}
 		if (affinityPolicy != 0) {
 		  CPU_ZERO(&cpu);
 		  CPU_SET(i % ncpus, &cpu);
@@ -187,14 +206,18 @@ int bench_futex_hash(int argc, const char **argv,
 	pthread_cond_broadcast(&thread_worker);
 	pthread_mutex_unlock(&thread_lock);
 
-	sleep(nsecs);
-	toggle_done(0, NULL, NULL);
+	// avoid sleep if using lockCountStop
+	if (lockCountStop == 0) {
+	  sleep(nsecs);
+	  toggle_done(0, NULL, NULL);
+	}
 
 	for (i = 0; i < nthreads; i++) {
 		ret = pthread_join(worker[i].thread, NULL);
 		if (ret)
 			err(EXIT_FAILURE, "pthread_join");
 	}
+	toggle_done(0, NULL, NULL);
 
 	/* cleanup & report results */
 	pthread_cond_destroy(&thread_parent);
@@ -202,16 +225,16 @@ int bench_futex_hash(int argc, const char **argv,
 	pthread_mutex_destroy(&thread_lock);
 
 	for (i = 0; i < nthreads; i++) {
-		unsigned long t = worker[i].ops/runtime.tv_sec;
+  	    unsigned long t = (double)worker[i].ops/(double)(runtime.tv_sec + runtime.tv_usec/1000000.0);
 		update_stats(&throughput_stats, t);
 		if (!silent) {
 			if (nfutexes == 1)
 				printf("[thread %2d] futex: %p [ %ld ops/sec ]\n",
-				       worker[i].tid, &worker[i].futex[0], t);
+				       worker[i].tid, worker[i].pfutex[0], t);
 			else
 				printf("[thread %2d] futexes: %p ... %p [ %ld ops/sec ]\n",
-				       worker[i].tid, &worker[i].futex[0],
-				       &worker[i].futex[nfutexes-1], t);
+				       worker[i].tid, worker[i].pfutex[0],
+				       worker[i].pfutex[nfutexes-1], t);
 		}
 
 		free(worker[i].futex);

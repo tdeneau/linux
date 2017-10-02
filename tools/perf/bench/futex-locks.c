@@ -1261,7 +1261,7 @@ static void futex_test_driver(const char *futex_type,
 	 * Unlike the other futex benchmarks, this one uses busy waiting
 	 * instead of pthread APIs to make sure that all the threads (except
 	 * the one that shares CPU with the parent) will start more or less
-	 * simultaineously.
+	 * simultaneously.
 	 */
 	atomic_inc_return(&worker_start);
 	// avoid sleep if using lockCountStop
