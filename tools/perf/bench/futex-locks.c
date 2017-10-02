@@ -148,6 +148,7 @@ static bool gettidOpMarker;
 static u64 tscTicksPerUs;
 static bool usetsc;
 static bool timeLockLatDelay;
+static int prefetchwLat;
 
 /*
  * Glibc mutex
@@ -294,6 +295,7 @@ static const struct option mutex_options[] = {
 	OPT_BOOLEAN ('G', "gettid-marks-lock",	&gettidOpMarker,  "if set, call gettid so lttng has some opmarker"),
 	OPT_BOOLEAN ('R', "use-rdtscp",  	&usetsc,  "if set, use rdtsc instead of clock_gettime for timestat"),
 	OPT_BOOLEAN ('L', "time-locklat-delay", &timeLockLatDelay,  "if set, show avg times for locklat delay loop"),
+	OPT_INTEGER ('P', "prefetch-write-latency",	&prefetchwLat,  "Specify delay during load latency for prefetch-write to issue"),
 	OPT_END()
 };
 
@@ -862,10 +864,11 @@ static inline u64 nsnow(void){
   return((stime.tv_sec*1000000000L+stime.tv_nsec));
 }
 
-static inline void csdelay(int n, int tid)
+static inline void csdelay(int n, int tid, int nprefetchw, futex_t *futexaddr __maybe_unused)
 {
   struct worker *w = &worker[tid];
   u32 sum = 0;
+  // for now nprefetchw ignored unless delayPolicy == 3
 
   if (delayPolicy == 0) {
 	while (n-- > 0) {
@@ -900,25 +903,43 @@ static inline void csdelay(int n, int tid)
 	}
   }
   else if (delayPolicy == 3) {
-#if 1
 	u64 now;
 	u64 dstart = nsnow();
-	do {
-	  now = nsnow();
-	} while (now - dstart < (unsigned)n);
+	if (true) {
+	  if (unlikely(nprefetchw > 0)) {
+		do {
+		  now = nsnow();
+		} while (now - dstart < (unsigned)nprefetchw);
+		// then issue prefetchw
+#if 1
+		asm volatile("prefetchw  %0;" : : "m"(*futexaddr) );
 #else
-	// see if any big amounts in last increment
-	u64 now, prev;
-	u64 dstart = nsnow();
-	now = dstart;
-	do {
-	  prev = now;
-	  now = nsnow();
-	} while (now - dstart < (unsigned)n);
-	if ((tid==1) && (now-prev > 200)) {
-	  printf("%ld\n", now - prev);
-	}
+		asm volatile("prefetchw  %0;" : : "m"(*w) );   // a "useless" prefetch
 #endif
+		// then finish csdelay
+		while (now - dstart < (unsigned)n) {
+		  now = nsnow();
+		} 
+	  }
+	  else {
+		// normal logic (no prefetchw)
+		do {
+		  now = nsnow();
+		} while (now - dstart < (unsigned)n);
+	  }
+	}
+	else {
+	  // see if any big amounts in last increment
+	  u64 prev;
+	  now = dstart;
+	  do {
+		prev = now;
+		now = nsnow();
+	  } while (now - dstart < (unsigned)n);
+	  if ((tid==1) && (now-prev > 200)) {
+		printf("%ld\n", now - prev);
+	  }
+	}
   }
   else {
 	printf("Unknown delay policy %d\n", delayPolicy);
@@ -930,6 +951,7 @@ static inline void csdelay(int n, int tid)
 /*
  * Load function
  */
+#if 0
 static inline void load(int tid  __maybe_unused)
 {
 	/*
@@ -943,8 +965,9 @@ static inline void load(int tid  __maybe_unused)
 	}
 #endif
   
-  csdelay(loadlat, tid);
+  csdelay(loadlat, tid, prefetchwLat, );
 }
+#endif
 
 
 static void toggle_done(int sig __maybe_unused,
@@ -965,6 +988,11 @@ static void *mutex_workerfn(void *arg)
 	struct worker *w = &worker[tid];
 	lock_fn_t lock_fn = mutex_lock_fn;
 	unlock_fn_t unlock_fn = mutex_unlock_fn;
+	// the futex we will be operating on (in case csdelay needs it)
+	futex_t *futexaddr = w->futex;
+	if (!strcmp(ftype, "GC") || !strcmp(ftype, "GC2")) {
+	  futexaddr = (futex_t *)&w->pmutex->__data.__lock;
+	}
 	// u32 ops_count = 0;
 
 	for (int i=0; i<1; i++) {
@@ -991,7 +1019,7 @@ static void *mutex_workerfn(void *arg)
 	do {
         int locklat;
 		lock_fn(w->futex, tid);
-		load(tid);
+		csdelay(loadlat, tid, prefetchwLat, futexaddr);
 		unlock_fn(w->futex, tid);
 		if (gettidOpMarker) {
 		  syscall(SYS_gettid);
@@ -1009,20 +1037,20 @@ static void *mutex_workerfn(void *arg)
 		  locklat = locklatLo + (randval % (locklatHi - locklatLo));
 		}
 		if (!timeLockLatDelay) {
-		  csdelay(locklat, tid);
+		  csdelay(locklat, tid, 0, NULL);
 		}
 		else {
 		  if (!usetsc) {
 			struct timespec stime;
 			clock_gettime(CLOCK_REALTIME, &stime);  
-			csdelay(locklat, tid);
+			csdelay(locklat, tid, 0, NULL);
 			compute_systime(tid, TIME_LOCKLAT_DELAY, &stime);
 		  }
 		  else {
 			u32 aux;
 			u64 tsstart, elapsed;
 			tsstart = __rdtscp(&aux);
-			csdelay(locklat, tid);
+			csdelay(locklat, tid, 0, NULL);
 			elapsed = __rdtscp(&aux) - tsstart;
 			worker[tid].times[TIME_LOCKLAT_DELAY] += elapsed;
 		  }
