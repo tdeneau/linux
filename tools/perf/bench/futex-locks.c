@@ -140,8 +140,8 @@ static struct stats throughput_stats;
 static lock_fn_t mutex_lock_fn;
 static unlock_fn_t mutex_unlock_fn;
 static u32 WORKERBUFSIZE;
-static int delayPolicy = 2;  // policy 2 (nops) is default for now
-static int affinityPolicy = 0;
+static int delayPolicy = 3;  // policy 3 (timer-based) is default for now
+static int affinityPolicy = 0; // default is no pthread_set_affinity
 static int lockCountStop = 0;  // if set, stop after this many lock ops each thread
 static bool uncontendedMutex; 
 static bool gettidOpMarker; 
@@ -276,7 +276,7 @@ static inline void stat_inc(int tid __maybe_unused, int item __maybe_unused)
  */
 static const struct option mutex_options[] = {
     OPT_STRING  ('d', "locklat",	&locklatStr, "int", "Specify inter-locking latency, supports random within range (default = 1)"),
-	OPT_STRING  ('f', "ftype",	&ftype,    "type", "Specify futex type: WW, PI, GC, GC2, WW2, NOU, NOK, QS, NONE, all (default)"),
+	OPT_STRING  ('f', "ftype",	&ftype,    "type", "Specify futex type: WW, PI, GC, GC2, WW2, NOU, NOK, LSE, ULSE, QS, NONE, all (default)"),
 	OPT_INTEGER ('l', "loadlat",	&loadlat,  "Specify load latency (default = 1)"),
 	OPT_UINTEGER('r', "runtime",	&nsecs,    "Specify runtime (in seconds, default = 10s)"),
 	OPT_BOOLEAN ('S', "shared",	&fshared,  "Use shared futexes instead of private ones"),
@@ -780,6 +780,42 @@ static void gc2_mutex_unlock(futex_t *futex __maybe_unused,
 }
 
 
+/*
+ * This version times the futex wait syscall path but short circuits
+ * with an error because the passed in val will always be wrong.  It
+ * still goes thru the hashbucket lock, etc.  This is similar to the
+ * logic used in futex hash bmk but in futex hash the futex is
+ * uncontended, wherease here the same futex is contended among
+ * several threads. (This is not really a mutex but we wanted to time
+ * this path)
+ */
+
+static void lse_mutex_lock(futex_t *futex, int tid __maybe_unused)
+{
+	int ret  __maybe_unused;
+
+	stat_inc(tid, STAT_FUTEX_WAIT_CALLS);
+	stat_inc(tid, STAT_LOCKS);
+	FUTEX_CALL(futex_wait, TIME_LOCK, futex, 1234, ptospec, flags);
+}
+
+
+/*
+ * This version times the futex wake syscall path but short circuits
+ * because there will never be any thread to wake up. It still goes
+ * thru the hashbucket lock, etc.  (This is not really a mutex but we
+ * wanted to time this path)
+ */
+
+static void ulse_mutex_unlock(futex_t *futex, int tid __maybe_unused)
+{
+	int ret  __maybe_unused;
+
+	stat_inc(tid, STAT_UNLOCKS);
+	FUTEX_CALL(futex_wake, TIME_UNLK, futex, 1, flags);
+}
+
+
 
 /*************************
  *   MCS lock routines
@@ -868,6 +904,8 @@ static inline void csdelay(int n, int tid, int nprefetchw, futex_t *futexaddr __
 {
   struct worker *w = &worker[tid];
   u32 sum = 0;
+  if (n==0) return;
+  
   // for now nprefetchw ignored unless delayPolicy == 3
 
   if (delayPolicy == 0) {
@@ -1183,9 +1221,17 @@ static int futex_mutex_type(const char **ptype)
 		*ptype = "QS";
 		mutex_lock_fn = lock_mcs;
 		mutex_unlock_fn = unlock_mcs;
-
 		mcs_cnt_lock = NULL;      // global control lock
-
+	} else if (!strcasecmp(type, "LSE")) {
+	  // lock syscall (futex-wait) with error
+	    *ptype = "LSE";
+		mutex_lock_fn = lse_mutex_lock;
+		mutex_unlock_fn =  null_mutex_unlock;
+	} else if (!strcasecmp(type, "ULSE")) {
+	  // lock syscall (futex-wake) with error
+	    *ptype = "ULSE";
+		mutex_lock_fn = null_mutex_lock;
+		mutex_unlock_fn =  ulse_mutex_unlock;
 	} else if (!strcasecmp(type, "NONE")) {
 		*ptype = "NONE";
 		mutex_lock_fn = null_mutex_lock;

@@ -39,7 +39,6 @@ static unsigned int threads_starting;
 static struct stats throughput_stats;
 static pthread_cond_t thread_parent, thread_worker;
 static int affinityPolicy = 0;
-static bool commonFutexes;
 static int lockCountStop;
 
 struct worker {
@@ -57,7 +56,6 @@ static const struct option options[] = {
 	OPT_BOOLEAN( 's', "silent",  &silent,   "Silent mode: do not display data/details"),
 	OPT_BOOLEAN( 'S', "shared",  &fshared,  "Use shared futexes instead of private ones"),
 	OPT_INTEGER ('A', "affinity-policy",  &affinityPolicy,  "0 = do not call pthread_set_affinity, 1 = affinitize to sequential cpus"),
-	OPT_BOOLEAN( 'c', "common-futexes",  &commonFutexes,  "Use futexes that are common to all threads (stresses spinlock)"),
 	OPT_INTEGER ('C', "lock-count-stop",  &lockCountStop,  "if set, stop after this many lock ops each thread"),
 	OPT_END()
 };
@@ -164,7 +162,6 @@ int bench_futex_hash(int argc, const char **argv,
 	else {
 	  printf("for %d secs.\n", nsecs);
 	}
-	printf("%s\n\n", commonFutexes ? "all threads contend on the same futexes" : "each thread has its own futexes");
 	
 	init_stats(&throughput_stats);
 	pthread_mutex_init(&thread_lock, NULL);
@@ -181,7 +178,7 @@ int bench_futex_hash(int argc, const char **argv,
 			goto errmem;
 		worker[i].pfutex = calloc(nfutexes, sizeof(u_int32_t *));
 		for (j=0; j < nfutexes; j++) {
-		  worker[i].pfutex[j] = (commonFutexes ? &worker[0].futex[j] : &worker[i].futex[j]);
+		  worker[i].pfutex[j] = &worker[i].futex[j];
 		}
 		if (affinityPolicy != 0) {
 		  CPU_ZERO(&cpu);
