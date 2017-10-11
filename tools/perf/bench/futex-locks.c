@@ -149,6 +149,8 @@ static u64 tscTicksPerUs;
 static bool usetsc;
 static bool timeLockLatDelay;
 static int prefetchwLat;
+static int mcsSpinCount;
+static bool adaptiveMutex;
 
 /*
  * Glibc mutex
@@ -296,6 +298,8 @@ static const struct option mutex_options[] = {
 	OPT_BOOLEAN ('R', "use-rdtscp",  	&usetsc,  "if set, use rdtsc instead of clock_gettime for timestat"),
 	OPT_BOOLEAN ('L', "time-locklat-delay", &timeLockLatDelay,  "if set, show avg times for locklat delay loop"),
 	OPT_INTEGER ('P', "prefetch-write-latency",	&prefetchwLat,  "Specify delay during load latency for prefetch-write to issue"),
+	OPT_INTEGER ('M', "mcs-spin-counter",	&mcsSpinCount,  "how long we delay in mcs spin loop between read retries"),
+	OPT_BOOLEAN ('a', "adaptive-mutex", &adaptiveMutex,  "if set, show avg times for locklat delay loop"),
 	OPT_END()
 };
 
@@ -832,7 +836,23 @@ static inline void *xchg_64(void *ptr, void *x)
 
 #define cmpxchg64(P, O, N) __sync_val_compare_and_swap((P), (O), (N))
 
-static inline void lock_mcs(futex_t *futex __maybe_unused, int tid)
+
+static inline void mcs_relax(void)
+{
+  int n = mcsSpinCount;
+  if (n == 0) {
+	cpu_relax();
+  } else {
+	// do a bunch of nops so we don't go back and read too soon
+	while (n--) {
+	  cpu_relax();
+	  // asm volatile ("nop" : : : "memory");
+	}
+  }
+	
+}
+
+static void lock_mcs(futex_t *futex __maybe_unused, int tid)
 {
     mcs_lock_t *tail;
 	mcs_lock *m;      // global lock
@@ -857,12 +877,14 @@ static inline void lock_mcs(futex_t *futex __maybe_unused, int tid)
     barrier();
     
     /* Spin on my spin variable */
-    while (!me->spin) cpu_relax();
+    while (!me->spin) {
+	  mcs_relax();
+	}
     
     return;
 }
 
-static inline void unlock_mcs(futex_t *futex __maybe_unused, int tid)
+static void unlock_mcs(futex_t *futex __maybe_unused, int tid)
 {
 	mcs_lock *m;      // global lock
 	mcs_lock_t *me;   // 
@@ -881,7 +903,9 @@ static inline void unlock_mcs(futex_t *futex __maybe_unused, int tid)
 		stat_inc(tid, STAT_MCS_UNLOCKS);
 	
         /* Wait for successor to appear */
-        while (!me->next) cpu_relax();
+        while (!me->next) {
+		  mcs_relax();
+		}
     }
 
     /* Unlock next one */
@@ -1168,18 +1192,27 @@ static void create_threads(struct worker *w, pthread_attr_t *thread_attr,
 }
 
 static void mutex_setup_common(void) {
+  int type;
   pthread_mutexattr_t *attr = NULL;
   
   /*
    * Initialize pthread mutex
    */
+  attr = &mutex_attr;
+  pthread_mutexattr_init(attr);
+  mutex_attr_inited = true;
   if (fshared) {
-	attr = &mutex_attr;
-	pthread_mutexattr_init(attr);
-	mutex_attr_inited = true;
 	pthread_mutexattr_setpshared(attr, true);
   }
+  if (adaptiveMutex) {
+	attr = &mutex_attr;
+	pthread_mutexattr_settype(attr, PTHREAD_MUTEX_ADAPTIVE_NP);
+	mutex_attr_inited = true;
+  }
   pthread_mutex_init(&mutex, attr);
+  pthread_mutexattr_gettype(attr, &type);
+  printf("pthread attr type is %d\n", type);
+  
   mutex_inited = true;
 }
 
