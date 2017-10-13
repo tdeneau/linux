@@ -298,7 +298,7 @@ static const struct option mutex_options[] = {
 	OPT_BOOLEAN ('R', "use-rdtscp",  	&usetsc,  "if set, use rdtsc instead of clock_gettime for timestat"),
 	OPT_BOOLEAN ('L', "time-locklat-delay", &timeLockLatDelay,  "if set, show avg times for locklat delay loop"),
 	OPT_INTEGER ('P', "prefetch-write-latency",	&prefetchwLat,  "Specify delay during load latency for prefetch-write to issue"),
-	OPT_INTEGER ('M', "mcs-spin-counter",	&mcsSpinCount,  "how long we delay in mcs spin loop between read retries"),
+	OPT_INTEGER ('M', "mcs-spin-counter",	&mcsSpinCount,  "0=pause, 1=nops, 2=monitorx,mwaitx (ZP only)"),
 	OPT_BOOLEAN ('a', "adaptive-mutex", &adaptiveMutex,  "if set, show avg times for locklat delay loop"),
 	OPT_END()
 };
@@ -839,17 +839,62 @@ static inline void *xchg_64(void *ptr, void *x)
 
 static inline void mcs_relax(void)
 {
-  int n = mcsSpinCount;
-  if (n == 0) {
 	cpu_relax();
-  } else {
-	// do a bunch of nops so we don't go back and read too soon
-	while (n--) {
-	  cpu_relax();
-	  // asm volatile ("nop" : : : "memory");
+}
+
+static inline void doNopsSpin(volatile int *pflag) {
+  while (!*pflag) {
+	asm volatile ("nop" : : : "memory");
+	asm volatile ("nop" : : : "memory");
+	asm volatile ("nop" : : : "memory");
+	asm volatile ("nop" : : : "memory");
+	asm volatile ("nop" : : : "memory");
+  }
+}
+
+static inline void doPauseSpin(volatile int *pflag) {
+  while (!*pflag) {
+	cpu_relax();
+  }
+}
+
+static inline void doMonitorxSpin(volatile int *pflag) {
+  while (!*pflag) {
+	// monitorx
+	asm volatile(
+	  "mov %0, %%rax; \n\t"
+	  "xor %%ecx, %%ecx; \n\t"
+	  "xor %%edx, %%edx; \n\t"
+	  "monitorx; \n\t"
+	  :
+	  : "r"(pflag)
+	  : "%rax", "%ecx", "%edx"
+	  );
+	// check if flag has already been set
+	if (!*pflag) {
+	  // mwaitx
+	  // eax <- f0 means use cstate 0
+	  // ecx <- 1 means allow interrupts to wake
+	  asm volatile(
+		"mov $0xf0, %%eax; \n\t"
+		"mov $0, %%ecx; \n\t"
+		"mwaitx; \n\t"
+		:
+		: 
+		: "%eax", "%ecx"
+		);
 	}
   }
-	
+}
+
+static inline void doSpin(volatile int *pflag) {
+  if (mcsSpinCount == 0) {
+	doPauseSpin(pflag);
+  } else if (mcsSpinCount == 1) {
+	doNopsSpin(pflag);
+  } else {
+	doMonitorxSpin(pflag);
+  }
 }
 
 static void lock_mcs(futex_t *futex __maybe_unused, int tid)
@@ -877,10 +922,8 @@ static void lock_mcs(futex_t *futex __maybe_unused, int tid)
     barrier();
     
     /* Spin on my spin variable */
-    while (!me->spin) {
-	  mcs_relax();
-	}
-    
+	doSpin(&me->spin);
+
     return;
 }
 
@@ -903,8 +946,8 @@ static void unlock_mcs(futex_t *futex __maybe_unused, int tid)
 		stat_inc(tid, STAT_MCS_UNLOCKS);
 	
         /* Wait for successor to appear */
-        while (!me->next) {
-		  mcs_relax();
+		while (!me->next) {
+		  cpu_relax();
 		}
     }
 
