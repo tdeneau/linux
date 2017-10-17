@@ -66,6 +66,7 @@ enum {
 	STAT_MCS_UNLOCKS,	/* # for mcs only */
 	STAT_FUTEX_WAIT_CALLS, 
 	STAT_LOCKS_SUCC2, /* # of locks that took slowpath but did not call futex wait */
+	STAT_NOK_TRIES,   /* # of cmpxchg tries in NOK lock */
 	STAT_GETTID,      /* for minimum syscall timing */
 	STAT_NUM	      /* Total # of statistical count		*/
 };
@@ -149,7 +150,7 @@ static u64 tscTicksPerUs;
 static bool usetsc;
 static bool timeLockLatDelay;
 static int prefetchwLat;
-static int mcsSpinCount;
+static int mcsSpinStrategy;
 static bool adaptiveMutex;
 
 /*
@@ -188,6 +189,14 @@ static void show_stat_percent(struct worker *w, int top, int bottom, const char 
 	printf("%%\n");
   }
 }
+
+static void show_stat_ratio(struct worker *w, int top, int bottom, const char *desc)
+{
+  if (w->stats[top])
+	  printf("%-30s = %.1f\n", desc, (double)w->stats[top]/w->stats[bottom]);
+}
+
+
 static void stat_syscall_time(struct worker *w, const char *label, int timeitem, int countitem) {
   u64 avg;
   double nstime = w->times[timeitem];
@@ -290,7 +299,7 @@ static const struct option mutex_options[] = {
 	OPT_INTEGER ('b', "bufstep",    &bufstep,  "Step size in bytes thru buffer during delays, default = 64"),
 	OPT_INTEGER ('x', "cmpxchg-limit",    &cmpxchg_limit,  "limit to number of cmpxchgs in nokernel_lock"),
 	OPT_INTEGER ('B', "worker-buf-size", &workerBufSizeInKB, "size in KB of worker buffer used in csdelay"),
-	OPT_INTEGER ('D', "delay-policy", &delayPolicy, "type of delay loop to use in csdelay\n 1=stores, 2=nops, 3=clock-based"),
+	OPT_INTEGER ('D', "delay-policy", &delayPolicy, "type of delay loop to use in csdelay\n 0,1=stores, 2=nops, 3=clock-based\nNote that non-clock-based policies do not measure as fair under contended workloads."),
 	OPT_INTEGER ('A', "affinity-policy",  &affinityPolicy,  "0 = do not call pthread_set_affinity, 1 = pthread_set_affinity each thr to 1 cpu in affinity set"),
 	OPT_INTEGER ('C', "lock-count-stop",  &lockCountStop,  "if set, stop after this many lock ops each thread"),
 	OPT_BOOLEAN ('U', "uncontended-mutex",	&uncontendedMutex,  "if set each thread gets its own mutex, so no contention"),
@@ -298,7 +307,7 @@ static const struct option mutex_options[] = {
 	OPT_BOOLEAN ('R', "use-rdtscp",  	&usetsc,  "if set, use rdtsc instead of clock_gettime for timestat"),
 	OPT_BOOLEAN ('L', "time-locklat-delay", &timeLockLatDelay,  "if set, show avg times for locklat delay loop"),
 	OPT_INTEGER ('P', "prefetch-write-latency",	&prefetchwLat,  "Specify delay during load latency for prefetch-write to issue"),
-	OPT_INTEGER ('M', "mcs-spin-counter",	&mcsSpinCount,  "0=pause, 1=nops, 2=monitorx,mwaitx (ZP only)"),
+	OPT_INTEGER ('M', "mcs-spin-strategy",	&mcsSpinStrategy,  "0=pause, 1=monitorx,mwaitx (ZP only), 2=nops count"),
 	OPT_BOOLEAN ('a', "adaptive-mutex", &adaptiveMutex,  "if set, show avg times for locklat delay loop"),
 	OPT_END()
 };
@@ -560,15 +569,19 @@ static void nousermode_mutex_unlock(futex_t *futex, int tid)
 	int ret;
 
 	if ((tid & 1) == 0) return;
+
+	while (1) {
+	  *futex = 0;
+	  stat_inc(tid, STAT_UNLOCKS);
+	  FUTEX_CALL(futex_wake, TIME_UNLK, futex, 1, flags);
 	
-	*futex = 0;
-	stat_inc(tid, STAT_UNLOCKS);
-	FUTEX_CALL(futex_wake, TIME_UNLK, futex, 1, flags);
-	
-	if (ret < 0)
-	  stat_inc(tid, STAT_UNLKERRS);
-	else
-	  stat_add(tid, STAT_WAKEUPS, ret);
+	  if (ret < 0) {
+		stat_inc(tid, STAT_UNLKERRS);
+	  } else {
+		stat_add(tid, STAT_WAKEUPS, ret);
+		if (ret > 0) return;
+	  }
+	}
 }
 
 
@@ -595,7 +608,8 @@ static void nokernel_mutex_lock(futex_t *futex, int tid)
 	}
 	
 	if (tries > 0) {
-	  stat_add(tid, STAT_LOCKS, tries);
+	  stat_inc(tid, STAT_LOCKS);
+	  stat_add(tid, STAT_NOK_TRIES, tries);
 	}
 
 	if (tries >= cmpxchg_limit) {
@@ -844,11 +858,10 @@ static inline void mcs_relax(void)
 
 static inline void doNopsSpin(volatile int *pflag) {
   while (!*pflag) {
-	asm volatile ("nop" : : : "memory");
-	asm volatile ("nop" : : : "memory");
-	asm volatile ("nop" : : : "memory");
-	asm volatile ("nop" : : : "memory");
-	asm volatile ("nop" : : : "memory");
+	int count = mcsSpinStrategy;
+	while (count-- > 0) {
+	  asm volatile ("nop" : : : "memory");
+	}
   }
 }
 
@@ -888,12 +901,12 @@ static inline void doMonitorxSpin(volatile int *pflag) {
 }
 
 static inline void doSpin(volatile int *pflag) {
-  if (mcsSpinCount == 0) {
+  if (mcsSpinStrategy == 0) {
 	doPauseSpin(pflag);
-  } else if (mcsSpinCount == 1) {
-	doNopsSpin(pflag);
-  } else {
+  } else if (mcsSpinStrategy == 1) {
 	doMonitorxSpin(pflag);
+  } else {
+	doNopsSpin(pflag);
   }
 }
 
@@ -940,6 +953,8 @@ static void unlock_mcs(futex_t *futex __maybe_unused, int tid)
     /* No successor yet? */
     if (!me->next)
     {
+		stat_inc(tid, STAT_UNLOCKS);
+
         /* Try to atomically unlock */
         if (cmpxchg64(m, me, NULL) == me) return;
 
@@ -1346,6 +1361,7 @@ static void futex_test_driver(const char *futex_type,
 		[STAT_MCS_UNLOCKS]  = "\nMCS unlock slowpaths",
 		[STAT_FUTEX_WAIT_CALLS]  = "Futex Wait Calls",
 		[STAT_LOCKS_SUCC2]  = "Slowpaths w/no futex waits",
+		[STAT_NOK_TRIES]  = "NOK Cmpxchg retries",
 		[STAT_GETTID] = "gettid",
 	};
 
@@ -1485,9 +1501,10 @@ print_stat:
 	show_stat_percent(&total, STAT_LOCKS, STAT_OPS, "Exclusive lock slowpaths");
 	show_stat_percent(&total, STAT_UNLOCKS, STAT_OPS, "Exclusive unlock slowpaths");
 	show_stat_percent(&total, STAT_EAGAINS, STAT_FUTEX_WAIT_CALLS, "EAGAIN lock errors");
-	if (total.stats[STAT_FUTEX_WAIT_CALLS])
-	  printf("%-30s = %.1f\n", "Futex waits per slow lock",
-			 (double)total.stats[STAT_FUTEX_WAIT_CALLS]/total.stats[STAT_LOCKS]);
+	show_stat_ratio(&total, STAT_FUTEX_WAIT_CALLS, STAT_LOCKS, "Futex waits per slow lock");
+	show_stat_ratio(&total, STAT_NOK_TRIES, STAT_OPS, "Cmpxchgs retries per lock (NOK locks)");
+	show_stat_percent(&total, STAT_LOCKERRS, STAT_OPS, (mutex_lock_fn == nokernel_mutex_lock ?
+														"Cmpxchgs Exceeded Limit" : "Other lock errors"));
 	show_stat_percent(&total, STAT_WAKEUPS, STAT_UNLOCKS, "Process Wakeups");
 
 	printf("\nPer-thread Locking Rates:\n");
