@@ -570,7 +570,7 @@ static void nousermode_mutex_unlock(futex_t *futex, int tid)
 
 	if ((tid & 1) == 0) return;
 
-	while (1) {
+	while (!done) {
 	  *futex = 0;
 	  stat_inc(tid, STAT_UNLOCKS);
 	  FUTEX_CALL(futex_wake, TIME_UNLK, futex, 1, flags);
@@ -624,7 +624,7 @@ static void nokernel_mutex_unlock(futex_t *futex, int tid)
 
 	val = atomic_xchg_release(futex, 0);
 
-	if (val != 0) {
+	if (val != 1) {
 		stat_inc(tid, STAT_UNLOCKS);
 	}
 }
@@ -1226,6 +1226,11 @@ static void create_threads(struct worker *w, pthread_attr_t *thread_attr,
 	  pthread_mutex_init(&w->mutex, NULL);
 	  w->futex = &w->my_own_futex;
 	  w->my_own_futex = 0;
+	  // special case, NOU type, and uncontended, share a futex between two threads
+	  // since each pair has one locker thread and one unlocker thread
+	  if (!strcmp(ftype, "NOU")) {
+		w->futex = &worker[tid & ~1].my_own_futex;
+	  }
 	}
 	w->randseed = tid + 100;
 
