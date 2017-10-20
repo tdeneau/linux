@@ -122,6 +122,31 @@ static void print_summary(void)
 	       (double) runtime.tv_sec + runtime.tv_usec/1000000.0 );
 }
 
+int *cpulist;
+int cpulistCount;
+cpu_set_t cpuSetAll;
+
+static void build_cpu_list(void)
+{
+  int idx, n;
+  
+  CPU_ZERO(&cpuSetAll);
+  sched_getaffinity(getpid(), sizeof(cpu_set_t), &cpuSetAll);
+  cpulistCount = CPU_COUNT(&cpuSetAll);
+  cpulist = malloc(cpulistCount * sizeof(int));
+  idx = 0;
+  printf("cpulist: ");
+  for (n=0; (n < CPU_SETSIZE) && (idx < cpulistCount); n++) {
+	if (CPU_ISSET(n, &cpuSetAll)) {
+	  cpulist[idx++] = n;
+	  printf("%d, ", n);
+	}
+  }
+  printf("\n");
+}
+
+
+
 int bench_futex_hash(int argc, const char **argv,
 		     const char *prefix __maybe_unused)
 {
@@ -154,6 +179,9 @@ int bench_futex_hash(int argc, const char **argv,
 	if (!fshared)
 		futex_flag = FUTEX_PRIVATE_FLAG;
 
+	// calculate cpulist
+	build_cpu_list();
+	
 	printf("Run summary [PID %d]: %d threads, each operating on %d [%s] futexes ",
 	       getpid(), nthreads, nfutexes, fshared ? "shared":"private");
 	if (lockCountStop) {
@@ -182,7 +210,8 @@ int bench_futex_hash(int argc, const char **argv,
 		}
 		if (affinityPolicy != 0) {
 		  CPU_ZERO(&cpu);
-		  CPU_SET(i % ncpus, &cpu);
+		  // not sure pinning to 1 cpu makes any difference but it was easy to implement
+		  CPU_SET(cpulist[i % cpulistCount], &cpu);
 
 		  ret = pthread_attr_setaffinity_np(&thread_attr, sizeof(cpu_set_t), &cpu);
 		  if (ret)

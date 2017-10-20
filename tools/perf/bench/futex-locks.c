@@ -982,9 +982,8 @@ static inline u64 nsnow(void){
   return((stime.tv_sec*1000000000L+stime.tv_nsec));
 }
 
-static inline void csdelay(int n, int tid, int nprefetchw, futex_t *futexaddr __maybe_unused)
+static inline void csdelay(int n, struct worker *w, int nprefetchw, futex_t *futexaddr __maybe_unused)
 {
-  struct worker *w = &worker[tid];
   u32 sum = 0;
   if (n==0) return;
   
@@ -1025,40 +1024,29 @@ static inline void csdelay(int n, int tid, int nprefetchw, futex_t *futexaddr __
   else if (delayPolicy == 3) {
 	u64 now;
 	u64 dstart = nsnow();
-	if (true) {
-	  if (unlikely(nprefetchw > 0)) {
-		do {
-		  now = nsnow();
-		} while (now - dstart < (unsigned)nprefetchw);
-		// then issue prefetchw
-#if 1
-		asm volatile("prefetchw  %0;" : : "m"(*futexaddr) );
-#else
-		asm volatile("prefetchw  %0;" : : "m"(*w) );   // a "useless" prefetch
-#endif
-		// then finish csdelay
-		while (now - dstart < (unsigned)n) {
-		  now = nsnow();
-		} 
-	  }
-	  else {
-		// normal logic (no prefetchw)
-		do {
-		  now = nsnow();
-		} while (now - dstart < (unsigned)n);
-	  }
+	if (unlikely(nprefetchw > 0)) {
+	  do {
+		now = nsnow();
+	  } while (now - dstart < (unsigned)nprefetchw);
+	  // then issue prefetchw
+	  asm volatile("prefetchw  %0;" : : "m"(*futexaddr) );
+	  // then finish csdelay
+	  while (now - dstart < (unsigned)n) {
+		now = nsnow();
+	  } 
 	}
 	else {
-	  // see if any big amounts in last increment
-	  u64 prev;
-	  now = dstart;
+	  // normal logic (no prefetchw)
 	  do {
-		prev = now;
 		now = nsnow();
 	  } while (now - dstart < (unsigned)n);
-	  if ((tid==1) && (now-prev > 200)) {
-		printf("%ld\n", now - prev);
-	  }
+	}
+	// for policy 3, in the case where we are timing
+	// we use futexaddr==NULL as a way do tell we are doing lockLat
+	// as opposed to csdelay(loadLat). so if this is lockLat,
+	// we can just register the timing stats here without a further gettime call.
+	if (unlikely(timeLockLatDelay) && (futexaddr == NULL)) {
+	  w->times[TIME_LOCKLAT_DELAY] += (now - dstart);
 	}
   }
   else {
@@ -1067,27 +1055,6 @@ static inline void csdelay(int n, int tid, int nprefetchw, futex_t *futexaddr __
   }
   
 }
-
-/*
- * Load function
- */
-#if 0
-static inline void load(int tid  __maybe_unused)
-{
-	/*
-	 * Optionally does a 1us sleep instead if wratio is defined and
-	 * is within bound.
-	 */
-#if 0
-  if (wratio && (((counter++ + tid) & 0x3ff) < wratio)) {
-		usleep(1);
-		return;
-	}
-#endif
-  
-  csdelay(loadlat, tid, prefetchwLat, );
-}
-#endif
 
 
 static void toggle_done(int sig __maybe_unused,
@@ -1100,6 +1067,47 @@ static void toggle_done(int sig __maybe_unused,
 	timersub(&end, &start, &runtime);
 	if (sig)
 		exit_now = true;
+}
+
+static inline void doLockLatDelay(struct worker *w) {
+
+  int locklat;
+  int tid;
+  // determine locklat to use (usually constant except for randomized)
+  if (likely(locklatHi == 0)) {
+	locklat = locklatLo;
+  }
+  else {
+	// generate a random value between locklatLo and locklatHi
+	int randval = rand_r(&w->randseed);
+	locklat = locklatLo + (randval % (locklatHi - locklatLo));
+  }
+
+  if (unlikely(locklat == 0)) return;
+  
+  // special case for clock_based delay type 3
+  // timing (if enbaled) will be handled inside csdelay
+  if (likely(delayPolicy == 3 || (!timeLockLatDelay))) {
+	csdelay(locklat, w, 0, NULL);
+	return;
+  }
+  
+  // here if we are timing and not using delayPolicy == 3
+  tid = w - &worker[0];
+  if (!usetsc) {
+	struct timespec stime;
+	clock_gettime(CLOCK_REALTIME, &stime);  
+	csdelay(locklat, w, 0, NULL);
+	compute_systime(tid, TIME_LOCKLAT_DELAY, &stime);
+  }
+  else {
+	u32 aux;
+	u64 tsstart, elapsed;
+	tsstart = __rdtscp(&aux);
+	csdelay(locklat, w, 0, NULL);
+	elapsed = __rdtscp(&aux) - tsstart;
+	worker[tid].times[TIME_LOCKLAT_DELAY] += elapsed;
+  }
 }
 
 static void *mutex_workerfn(void *arg)
@@ -1137,9 +1145,8 @@ static void *mutex_workerfn(void *arg)
 		cpu_relax();
 
 	do {
-        int locklat;
 		lock_fn(w->futex, tid);
-		csdelay(loadlat, tid, prefetchwLat, futexaddr);
+		csdelay(loadlat, w, prefetchwLat, futexaddr);
 		unlock_fn(w->futex, tid);
 		if (gettidOpMarker) {
 		  syscall(SYS_gettid);
@@ -1148,33 +1155,9 @@ static void *mutex_workerfn(void *arg)
 		if ((lockCountStop > 0) && (w->stats[STAT_OPS] >= (u32) lockCountStop)) {
 		  break;
 		}
-		if (locklatHi == 0) {
-		  locklat = locklatLo;
-		}
-		else {
-		  // generate a random value between locklatLo and locklatHi
-		  int randval = rand_r(&w->randseed);
-		  locklat = locklatLo + (randval % (locklatHi - locklatLo));
-		}
-		if (!timeLockLatDelay) {
-		  csdelay(locklat, tid, 0, NULL);
-		}
-		else {
-		  if (!usetsc) {
-			struct timespec stime;
-			clock_gettime(CLOCK_REALTIME, &stime);  
-			csdelay(locklat, tid, 0, NULL);
-			compute_systime(tid, TIME_LOCKLAT_DELAY, &stime);
-		  }
-		  else {
-			u32 aux;
-			u64 tsstart, elapsed;
-			tsstart = __rdtscp(&aux);
-			csdelay(locklat, tid, 0, NULL);
-			elapsed = __rdtscp(&aux) - tsstart;
-			worker[tid].times[TIME_LOCKLAT_DELAY] += elapsed;
-		  }
-		}
+
+		// do the interlock latency delay
+		doLockLatDelay(w);
 	}  while (!done);
 	
 	if (verbose)
