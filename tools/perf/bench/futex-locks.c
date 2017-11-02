@@ -287,7 +287,7 @@ static inline void stat_inc(int tid __maybe_unused, int item __maybe_unused)
  */
 static const struct option mutex_options[] = {
     OPT_STRING  ('d', "locklat",	&locklatStr, "int", "Specify inter-locking latency, supports random within range (default = 1)"),
-	OPT_STRING  ('f', "ftype",	&ftype,    "type", "Specify futex type: WW, PI, GC, GC2, WW2, NOU, NOK, LSE, ULSE, QS, NONE, all (default)"),
+	OPT_STRING  ('f', "ftype",	&ftype,    "type", "Specify futex type: WW, PI, GC, GC2, WW2, WW3, NOU, NOK, LSE, ULSE, QS, NONE, all (default)"),
 	OPT_INTEGER ('l', "loadlat",	&loadlat,  "Specify load latency (default = 1)"),
 	OPT_UINTEGER('r', "runtime",	&nsecs,    "Specify runtime (in seconds, default = 10s)"),
 	OPT_BOOLEAN ('S', "shared",	&fshared,  "Use shared futexes instead of private ones"),
@@ -537,6 +537,18 @@ static void ww2_mutex_unlock(futex_t *futex, int tid)
 			stat_add(tid, STAT_WAKEUPS, ret);
 	}
 }
+
+// variation where we read the value before doing a cmpxchg
+static void ww3_mutex_lock(futex_t *futex, int tid)
+{
+	futex_t val = *futex;
+	
+	if ((val == 0) && atomic_cmpxchg_acquire(futex, &val, 1))
+		return;
+
+	ww_mutex_lock_slowpath(futex, val, tid);
+}
+
 
 
 /*
@@ -1274,6 +1286,10 @@ static int futex_mutex_type(const char **ptype)
 		*ptype = "WW2";
 		mutex_lock_fn = ww2_mutex_lock;
 		mutex_unlock_fn = ww2_mutex_unlock;
+	} else if (!strcasecmp(type, "WW3")) {
+		*ptype = "WW3";
+		mutex_lock_fn = ww3_mutex_lock;
+		mutex_unlock_fn = ww_mutex_unlock;
 	} else if (!strcasecmp(type, "NOU")) {
 		*ptype = "NOU";
 		mutex_lock_fn = nousermode_mutex_lock;
