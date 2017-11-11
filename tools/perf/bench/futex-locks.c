@@ -67,6 +67,8 @@ enum {
 	STAT_FUTEX_WAIT_CALLS, 
 	STAT_LOCKS_SUCC2, /* # of locks that took slowpath but did not call futex wait */
 	STAT_NOK_TRIES,   /* # of cmpxchg tries in NOK lock */
+	STAT_FUTEX_WAIT_CALLS_RET_ZERO, 
+	STAT_FUTEX_WAKE_CALLS_RET_ZERO, 
 	STAT_GETTID,      /* for minimum syscall timing */
 	STAT_NUM	      /* Total # of statistical count		*/
 };
@@ -75,8 +77,12 @@ enum {
  * Syscall time list
  */
 enum {
-	TIME_LOCK,	/* Total exclusive lock syscall time	*/
-	TIME_UNLK,	/* Total exclusive unlock syscall time	*/
+	TIME_LOCK,	        /* Dummy place holder	*/
+	TIME_LOCK_RET_ZERO,	/* Total exclusive lock syscall time	*/
+	TIME_LOCK_RET_NONZERO,   /* same but with errors */
+	TIME_UNLK,	        /* Dummy place holder	*/
+	TIME_UNLK_RET_ZERO,	/* Total exclusive unlock syscall time	*/
+	TIME_UNLK_RET_NONZERO,   /* same but with errors */
 	TIME_GETTID, /* for minimum syscall timing */
 	TIME_LOCKLAT_DELAY, /* checks for slowdowns in cpu clk? */
 	TIME_NUM,
@@ -104,6 +110,7 @@ struct worker {
   pthread_mutex_t *pmutex; // points to either global or private
   pthread_mutex_t mutex;  // used for private mutexes
   futex_t my_own_futex;
+  bool  gotlock;         // used by NOK locker
 } __cacheline_aligned;
 
 /*
@@ -244,7 +251,11 @@ static pid_t gettid(long tid) {
 		  u64 elapsed = (__rdtscp(&aux) - tsstart); \
 		  worker[tid].times[item] += elapsed;		\
         } else {									\
-		  compute_systime(tid, item, &stime);		\
+          /*  note +1, +2 to get _RET_ZERO, NON_ZERO */  \
+		  if (ret == 0)                             \
+             compute_systime(tid, item+1, &stime);	\
+		  else                                      \
+		     compute_systime(tid, item+2, &stime);	\
 		}											\
 	} else {										\
 		ret = func(__VA_ARGS__);					\
@@ -627,17 +638,18 @@ static void nokernel_mutex_lock(futex_t *futex, int tid)
 	if (tries >= cmpxchg_limit) {
 	  stat_inc(tid, STAT_LOCKERRS);
 	}
+	else {
+	  struct worker *w = &worker[tid];
+	  w->gotlock = true;
+	}
 	
 }
 
-static void nokernel_mutex_unlock(futex_t *futex, int tid)
+static void nokernel_mutex_unlock(futex_t *futex, int tid __maybe_unused)
 {
-	futex_t val;
-
-	val = atomic_xchg_release(futex, 0);
-
-	if (val != 1) {
-		stat_inc(tid, STAT_UNLOCKS);
+    struct worker *w = &worker[tid];
+	if (w->gotlock) {
+	  atomic_xchg_release(futex, 0);
 	}
 }
 
@@ -1228,7 +1240,8 @@ static void create_threads(struct worker *w, pthread_attr_t *thread_attr,
 	  }
 	}
 	w->randseed = tid + 100;
-
+	w->gotlock = false;
+	
 	CPU_ZERO(&cpu);
 	w->affcpu = -1;    // default meaning no thread affinity
 	if (affinityPolicy == 1) {
@@ -1464,6 +1477,10 @@ print_stat:
 		for (j = 0; j < STAT_NUM; j++)
 			total.stats[j] += worker[i].stats[j];
 
+		// some calculations
+		total.stats[STAT_FUTEX_WAIT_CALLS_RET_ZERO] = total.stats[STAT_FUTEX_WAIT_CALLS] - total.stats[STAT_EAGAINS];
+		total.stats[STAT_FUTEX_WAKE_CALLS_RET_ZERO] = total.stats[STAT_UNLOCKS] - total.stats[STAT_WAKEUPS];  // assumes no multi-wakeups
+		
 		for (j = 0; j < TIME_NUM; j++)
 		  total.times[j] += worker[i].times[j];
 
@@ -1490,11 +1507,15 @@ print_stat:
 	if (timestat) {
 		printf("\nSyscall times:\n");
 		// note: want to divide by futex_wait_calls count since there can be several per slowpath
-		if (total.stats[STAT_FUTEX_WAIT_CALLS])
-		  stat_syscall_time(&total, "Avg exclusive lock syscall", TIME_LOCK, STAT_FUTEX_WAIT_CALLS);
+		if (total.stats[STAT_FUTEX_WAIT_CALLS_RET_ZERO])
+		  stat_syscall_time(&total, "Avg exclusive lock syscall no err", TIME_LOCK_RET_ZERO, STAT_FUTEX_WAIT_CALLS_RET_ZERO);
+		if (total.stats[STAT_EAGAINS])
+		  stat_syscall_time(&total, "Avg exclusive lock syscall, EAGAIN", TIME_LOCK_RET_NONZERO, STAT_EAGAINS);
 		// for unlocks, we always have exactly one syscall per slowpath so okay to use STAT_UNLOCKS here
-		if (total.stats[STAT_UNLOCKS])
-		  stat_syscall_time(&total, "Avg exclusive unlock syscall", TIME_UNLK, STAT_UNLOCKS);
+		if (total.stats[STAT_FUTEX_WAKE_CALLS_RET_ZERO])
+		  stat_syscall_time(&total, "Avg exclusive unlock syscall, no wake", TIME_UNLK_RET_ZERO, STAT_FUTEX_WAKE_CALLS_RET_ZERO);
+		if (total.stats[STAT_WAKEUPS])
+		  stat_syscall_time(&total, "Avg exclusive unlock syscall, wake one", TIME_UNLK_RET_NONZERO, STAT_WAKEUPS);
 		//if (total.stats[STAT_GETTID])
 		//  stat_syscall_time(&total, "Avg gettid syscall", TIME_GETTID, STAT_GETTID);
 		if (total.times[TIME_LOCKLAT_DELAY])
@@ -1506,7 +1527,7 @@ print_stat:
 	show_stat_percent(&total, STAT_UNLOCKS, STAT_OPS, "Exclusive unlock slowpaths");
 	show_stat_percent(&total, STAT_EAGAINS, STAT_FUTEX_WAIT_CALLS, "EAGAIN lock errors");
 	show_stat_ratio(&total, STAT_FUTEX_WAIT_CALLS, STAT_LOCKS, "Futex waits per slow lock");
-	show_stat_ratio(&total, STAT_NOK_TRIES, STAT_OPS, "Cmpxchgs retries per lock (NOK locks)");
+	show_stat_ratio(&total, STAT_NOK_TRIES, STAT_OPS, "Cmpxchgs retries per NOK lock");
 	show_stat_percent(&total, STAT_LOCKERRS, STAT_OPS, (mutex_lock_fn == nokernel_mutex_lock ?
 														"Cmpxchgs Exceeded Limit" : "Other lock errors"));
 	show_stat_percent(&total, STAT_WAKEUPS, STAT_UNLOCKS, "Process Wakeups");
